@@ -167,6 +167,10 @@ class Target:
         lc = tc["loop_config"]
         self.core = range(lc["core_start"], lc["core_end"])
         self.passes = lc["num_passes"]
+        # the layer visits whose input the draft head reads, and the final norm (the last id: the number of visits).
+        # [5, 23, 41, 48] for 3 passes; a varloop checkpoint run at 5 passes gives [5, 23, 65, 72] in its config.
+        ids = cfg.get("mtp_config", {}).get("target_layer_ids", [5, 23, 41, 48])
+        self.taps = tuple(ids[:-1])
         self.qthr, self.rthr = tc["qk_l2_clip_threshold"], tc["rel_l2_clip_threshold"]
         w = mx.load(str(Path(model_dir) / "model-00001-of-00001.safetensors"))
         g = lambda k: w["model.llm." + k]  # noqa: E731
@@ -257,10 +261,12 @@ class Target:
             mx.clear_cache()
         # 8-bit per-row-scaled copy of the unembedding: the short list of the exact argmax (and the draft's logits)
         self.un8 = kn.quant8(self.unembed.view(mx.bfloat16)[:self.vocab]) if SHORT else None
-        # the 48 layer applications
+        # the layer applications: 48 at 3 passes, 72 at 5
         cs, ce = self.core.start, self.core.stop
         self.apps = list(range(cs)) + list(self.core) * self.passes + list(range(ce, len(self.layers)))
         self.napp = len(self.apps)
+        assert len(ids) == 4 and ids[-1] == self.napp and all(0 <= t < self.napp for t in self.taps), \
+            f"mtp_config.target_layer_ids {ids} do not fit {self.napp} layer visits"
         self._fns = {}
         self.aidx = [mx.array([0, a], dtype=mx.int32) for a in range(self.napp)]     # index in the big tier's array, in the recent tier
         self.reset()
@@ -525,7 +531,7 @@ class Target:
         cs, ce = self.core.start, self.core.stop
         a = 0
         for i in range(cs):
-            if a == 5: feats.append(h)
+            if a in self.taps: feats.append(h)
             h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, None, meta, K, knew, vnew, wins); a += 1
         pre_h, pre_blocks = h, blocks
         for lp in range(self.passes):
@@ -534,9 +540,10 @@ class Target:
                 h, blocks = pre_h, pre_blocks
             for j, i in enumerate(self.core):
                 msgs = kn.mix(bank_blocks + [bank_part], self.msg_query[j]) if lp > 0 else None
-                if a in (23, 41): feats.append(h)
+                if a in self.taps: feats.append(h)
                 h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, msgs, meta, K, knew, vnew, wins); a += 1
         for i in range(ce, len(self.layers)):
+            if a in self.taps: feats.append(h)
             h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, None, meta, K, knew, vnew, wins); a += 1
         fo16 = kn.mix2(blocks + [h], self.out_query[None], norm_in=True, wt=self.norm[None])[:, 0]
         if K >= WIDE_MIN:           # wide pass: the caller takes the token of the one row it needs (prefill())

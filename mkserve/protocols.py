@@ -121,6 +121,9 @@ def add_routes(app: web.Application, core) -> None:
             lines += [f"# TYPE {name} {'gauge' if key == 'requests_running' else 'counter'}", f"{name} {value}"]
         return web.Response(text="\n".join(lines) + "\n", content_type="text/plain")
 
+    async def api_status(_request):
+        return web.json_response(core.status())
+
     # ------------------------------------------------------------------------------------------------ OpenAI
     async def models(_request):
         return web.json_response({"object": "list", "data": [{"id": core.name, "object": "model", "created": 0, "owned_by": "mkserve",
@@ -724,7 +727,7 @@ def add_routes(app: web.Application, core) -> None:
         return web.json_response({"error": "not supported by mkserve (one model, served as is)"}, status=501)
 
     app.add_routes([
-        web.get("/health", health), web.get("/metrics", metrics),
+        web.get("/health", health), web.get("/metrics", metrics), web.get("/api/status", api_status),
         web.get("/v1/models", models), web.post("/v1/completions", completions), web.post("/v1/chat/completions", chat_completions),
         web.post("/v1/responses", responses),
         web.post("/v1/messages", anthropic), web.post("/v1/messages/count_tokens", anthropic_count),

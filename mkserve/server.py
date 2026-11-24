@@ -356,6 +356,40 @@ class Core:
         self.stats = {"requests_total": 0, "requests_running": 0, "requests_failed_total": 0, "prompt_tokens_total": 0, "cached_prompt_tokens_total": 0,
                       "generation_tokens_total": 0, "time_to_first_token_seconds_sum": 0.0, "time_to_first_token_seconds_count": 0,
                       "time_per_output_token_seconds_sum": 0.0, "time_per_output_token_seconds_count": 0}
+        # GET /api/status (the shape of oMLX's, for desktop widgets): requests running now and the last one finished
+        self.started = time.time()
+        self.live: dict[int, dict] = {}     # rid -> {"start", "first", "prompt", "out", "marks": [(time, tokens)]}
+        self.last_request: dict | None = None
+        self.prefill_seconds = self.decode_seconds = 0.0
+        self.prefilled_total = 0
+
+    def status(self) -> dict:
+        """GET /api/status: the fields of oMLX's that a desktop widget reads, with the requests running now."""
+        st, now = self.stats, time.perf_counter()
+        prefilling, generating = [], []
+        for v in list(self.live.values()):
+            if v["first"] is None:
+                prefilling.append({"model": self.name, "processed": None, "total": v["prompt"], "tokens_per_second": None,
+                                   "elapsed_seconds": round(now - v["start"], 1)})
+            else:
+                marks = v["marks"]
+                rate = None
+                if len(marks) >= 2 and marks[-1][0] > marks[0][0]:
+                    rate = (marks[-1][1] - marks[0][1]) / (marks[-1][0] - marks[0][0])
+                elif now > v["first"] + 0.2:
+                    rate = v["out"] / (now - v["first"])
+                generating.append({"model": self.name, "generated_tokens": v["out"], "tokens_per_second": rate})
+        prompt, cached = st["prompt_tokens_total"], st["cached_prompt_tokens_total"]
+        return {"status": "ok", "server": "mkserve", "engine": self.args.engine_name, "version": "mkserve",
+                "uptime_seconds": round(time.time() - self.started, 1),
+                "default_model": self.name, "loaded_models": [self.name], "models_loaded": 1, "models_loading": 0,
+                "total_requests": st["requests_total"], "active_requests": st["requests_running"], "waiting_requests": 0,
+                "total_prompt_tokens": prompt, "total_completion_tokens": st["generation_tokens_total"], "total_cached_tokens": cached,
+                "cache_efficiency": round(100 * cached / prompt, 1) if prompt else 0.0,
+                "avg_prefill_tps": round(self.prefilled_total / self.prefill_seconds, 1) if self.prefill_seconds else 0.0,
+                "avg_generation_tps": round(st["generation_tokens_total"] / self.decode_seconds, 1) if self.decode_seconds else 0.0,
+                "max_context": self.hello.get("max_context"), "model_dir": str(getattr(self.args, "model_dir", "") or ""),
+                "live": {"prefilling": prefilling, "generating": generating}, "last_request": self.last_request}
 
     def check(self, ids: list[int], n: int) -> str | None:
         """The engines do not check their inputs (an out-of-range token id is an out-of-bounds read on the GPU):
@@ -418,6 +452,7 @@ class Core:
         st = self.stats
         t_start, t_first = time.perf_counter(), None
         st["requests_total"] += 1; st["requests_running"] += 1; st["prompt_tokens_total"] += len(ids)
+        live = self.live[rid] = {"start": t_start, "first": None, "prompt": len(ids), "out": 0, "marks": []}
         out: list[int] = []
         prefix = read = 0  # incremental detokenization: text is released when it is whole
         content, sent, finish, stop_seq, done = "", 0, None, None, False
@@ -451,6 +486,10 @@ class Core:
                 tokens, done = await q.get()
                 if t_first is None and tokens:
                     t_first = time.perf_counter()
+                    live["first"] = t_first
+                if tokens:
+                    live["out"] += len(tokens)
+                    live["marks"] = [m for m in live["marks"] if m[0] > time.perf_counter() - 3.0] + [(time.perf_counter(), live["out"])]
                     st["time_to_first_token_seconds_sum"] += t_first - t_start; st["time_to_first_token_seconds_count"] += 1
                 for token in tokens:
                     if token in stop_ids:
@@ -498,7 +537,18 @@ class Core:
                 st["time_per_output_token_seconds_sum"] += (time.perf_counter() - t_first) / (len(out) - 1)
                 st["time_per_output_token_seconds_count"] += 1
             self.queues.pop(rid, None)
+            cached = int(self.extra.get(rid, {}).get("cached_tokens", 0))
             self.extra.pop(rid, None)
+            self.live.pop(rid, None)
+            if t_first is not None:
+                t_end = time.perf_counter()
+                pf, dec = t_first - t_start, t_end - t_first
+                prefilled = max(0, len(ids) - cached)
+                self.prefill_seconds += pf; self.decode_seconds += dec; self.prefilled_total += prefilled
+                self.last_request = {"completed_at": time.time(), "prompt_tokens": len(ids), "prefilled_tokens": prefilled,
+                                     "prefill_seconds": round(pf, 3), "prefill_tps": round(prefilled / pf, 1) if pf > 0 else None,
+                                     "completion_tokens": len(out),
+                                     "decode_tps": round((len(out) - 1) / dec, 1) if dec > 0 and len(out) > 1 else None}
             if not done:  # ended early: a step-mode batch drops the row; a native engine cancels it if it can
                 self.writer.write((json.dumps({"cancel": rid}) + "\n").encode())
 
