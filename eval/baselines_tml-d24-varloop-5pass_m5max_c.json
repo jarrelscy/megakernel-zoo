@@ -1,0 +1,22 @@
+{
+ "model": "thinkingmachines/TML-d24-varloop-5pass",
+ "gpu": "Apple M5 Max (40-core GPU, 128 GB)",
+ "hw": "m5max",
+ "track": "c",
+ "provisional": true,
+ "calibre": "server end to end over HTTP, client clock (eval/client.py steady), B=1, greedy, ignore_eos; synthetic 64-token prompts and eval/natural_prompts.py, 1,024 new tokens; chat: GSM8K through the chat template, up to 512 new tokens. 1 warm-up + 3 repeats, one server start. Microseconds per token. Measured 2026-11-24 on this Mac.",
+ "systems": {
+  "omlx-0.8.1-fork-mtp": {
+   "tok_s": {
+    "synth": 43.0,
+    "natural": 44.6,
+    "chat": 45.6
+   },
+   "b1": 23256,
+   "b1_natural": 22422,
+   "b1_chat": 21930,
+   "short": "oMLX 0.8.1 fork (inkling2-fast-decode), raw checkpoint, the checkpoint's MTP head with remapped taps [5, 23, 65, 72]",
+   "general_engine": true
+  }
+ }
+}
