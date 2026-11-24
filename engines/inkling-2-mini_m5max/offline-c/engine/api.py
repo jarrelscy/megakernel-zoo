@@ -32,6 +32,9 @@ class Engine:
         self.max_batch, self.max_context = int(max_batch), int(max_context)
         info = mx.device_info()
         mx.set_wired_limit(info["max_recommended_working_set_size"])
+        # MLX keeps freed buffers for reuse. The temporary arrays of a long prefill (masks of a wide pass over 90,000 keys
+        # are gigabytes each) would otherwise stay held: 102 GB in all after a 91,000-token prompt at 131,072 context.
+        mx.set_cache_limit(int(float(os.environ.get("MK_CACHE_GB", "4")) * 2**30))
         self.tg = Target(model_dir, self.max_context)
         self.vocab = self.tg.vocab
         self.draft = None

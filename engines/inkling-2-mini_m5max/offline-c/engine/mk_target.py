@@ -156,7 +156,8 @@ class Target:
         assert tc["d_rel"] == 16 and tc["rel_extent"] == 1024 and tc["sliding_window_size"] == 1024
         assert tc["mlp_gate_softcap"] == 4.0 and tc["mlp_up_softcap"] == 25.0 and tc["route_scale"] == 8.0
         self.T = int(max_context) + 8
-        assert self.T <= 65536 + 8, "context too long (the K/V of 65,536 positions is 12.8 GB)"
+        # K/V: 4 KB per position per layer visit (48 visits at 3 passes: 12.8 GB at 65,536; 72 at 5 passes: 38.7 GB at 131,072)
+        assert self.T <= 131072 + 8, "context too long (at most 131,072 positions)"
         self.smax = self.T + 8
         # global-attention layers scale q by tau = 1 + alpha log(max((position + 1) / n_floor, 1)): 1 below n_floor
         self.tau = (float(tc["log_scaling_alpha"]), float(tc["log_scaling_n_floor"])) if self.T + 1 > tc["log_scaling_n_floor"] else None

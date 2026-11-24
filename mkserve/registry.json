@@ -321,7 +321,7 @@
       "env": {
        "MK_PREFILL": "fast"
       },
-      "max_context_limit": 32768
+      "max_context_limit": 131072
      }
     },
     "min_memory_gb": 36
