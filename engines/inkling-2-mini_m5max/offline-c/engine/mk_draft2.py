@@ -104,10 +104,14 @@ class Draft2(md.Draft):
         self.fc = w["fc.weight"]                                                                     # [2304, 5 * 2304] bf16
         self.hidden_norm = f32("hidden_norm.weight")
         self.norm = f32("norm.weight")
-        import torch
-        m = torch.load(str(d / "mask_embedding.pt"), map_location="cpu", weights_only=True)
-        assert int(m["mask_token_id"]) == cfg["dflash_config"]["mask_token_id"]
-        self.mask_embed = mx.array(m["embedding"].float().numpy())
+        if (d / "mask_embedding.npy").exists():        # the vector of mask_embedding.pt, saved without PyTorch's format
+            import numpy as np
+            self.mask_embed = mx.array(np.load(str(d / "mask_embedding.npy")).astype("float32"))
+        else:
+            import torch
+            m = torch.load(str(d / "mask_embedding.pt"), map_location="cpu", weights_only=True)
+            assert int(m["mask_token_id"]) == cfg["dflash_config"]["mask_token_id"]
+            self.mask_embed = mx.array(m["embedding"].float().numpy())
         self.w1 = w["markov_head.markov_w1.weight"]                                                  # [V, 256] bf16
         w2 = w["markov_head.markov_w2.weight"]                                                       # [V, 256] bf16
         self.w2b = w2                                                                                # rows gathered by candidate
