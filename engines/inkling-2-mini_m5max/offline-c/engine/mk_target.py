@@ -172,6 +172,16 @@ class Target:
         # [5, 23, 41, 48] for 3 passes; a varloop checkpoint run at 5 passes gives [5, 23, 65, 72] in its config.
         ids = cfg.get("mtp_config", {}).get("target_layer_ids", [5, 23, 41, 48])
         self.taps = tuple(ids[:-1])
+        # MK_DRAFT2: the 2DSD drafter (mk_draft2.py) reads the inputs of five weight layers in the last loop instead
+        # (default for a variable-loop checkpoint when the drafter is on this Mac; MK_DRAFT2=0 keeps the checkpoint's head)
+        d2_default = str(Path.home() / "Models/Inkling/2dsd-varloop-dspark")
+        self.draft2 = os.environ.get("MK_DRAFT2", d2_default if tc["loop_config"].get("is_varloop") else "")
+        if self.draft2 == "0" or not (Path(self.draft2) / "config.json").exists():
+            self.draft2 = ""
+        if self.draft2:
+            import mk_draft2
+            d2 = json.loads((Path(self.draft2) / "config.json").read_text())["loopedtf_drafter"]
+            self.taps = mk_draft2.last_loop_taps(tc, d2["feature_layers_per_loop"])
         self.qthr, self.rthr = tc["qk_l2_clip_threshold"], tc["rel_l2_clip_threshold"]
         w = mx.load(str(Path(model_dir) / "model-00001-of-00001.safetensors"))
         g = lambda k: w["model.llm." + k]  # noqa: E731
@@ -266,7 +276,7 @@ class Target:
         cs, ce = self.core.start, self.core.stop
         self.apps = list(range(cs)) + list(self.core) * self.passes + list(range(ce, len(self.layers)))
         self.napp = len(self.apps)
-        assert len(ids) == 4 and ids[-1] == self.napp and all(0 <= t < self.napp for t in self.taps), \
+        assert (self.draft2 or (len(ids) == 4 and ids[-1] == self.napp)) and all(0 <= t < self.napp for t in self.taps), \
             f"mtp_config.target_layer_ids {ids} do not fit {self.napp} layer visits"
         self._fns = {}
         self.aidx = [mx.array([0, a], dtype=mx.int32) for a in range(self.napp)]     # index in the big tier's array, in the recent tier

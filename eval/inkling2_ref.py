@@ -112,7 +112,8 @@ class Config:
         cfg = cls(**{k: text[k] for k in names})
         lc = text.get("loop_config")
         if lc:
-            assert not lc.get("is_varloop"), "variable-loop checkpoints are not supported"
+            # a variable-loop checkpoint (is_varloop) has the same tensors (1,244, the same shapes); it was trained to run
+            # at several pass counts, and runs at the num_passes its config states
             cfg.loop = (lc["core_start"], lc["core_end"], lc["num_passes"])
             assert cfg.loop[0] % cfg.n_layers_per_attn_res_block == 0 and cfg.loop[1] % cfg.n_layers_per_attn_res_block == 0
         # the swa_* fields equal the global ones in this checkpoint; the code below assumes it
