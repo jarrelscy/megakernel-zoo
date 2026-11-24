@@ -34,6 +34,11 @@ PROJT = os.environ.get("MK_PROJT", "0") == "1"       # transposed relative-bias 
 BR_MAX = int(os.environ.get("MK_BR_MAX", "3"))
 LAYOUT4 = os.environ.get("MK_LAYOUT4", "1") == "1"
 PAD = int(os.environ.get("MK_WHATIF_PAD", "0"))   # timing experiment only (0 in the engine)
+# independent dispatches of a layer visit in one (kernels: merged dispatches): the q / k / v projections; the three
+# message gates' projections. Same bits (tests/merge.py); no measurable gain (a dispatch costs 1.4 us), so off
+DENSE3 = os.environ.get("MK_DENSE3", "0") == "1"
+GATEM = os.environ.get("MK_GATEM", "0") == "1"
+SL_C = int(os.environ.get("MK_SL_C", "4096"))       # tokens whose exact logits a readout computes (0: the 8-bit scan)
 
 
 WHATIF_NO = os.environ.get("MK_WHATIF_NO", "")     # timing experiment only: "dense" / "experts" replaced by a stand-in
@@ -127,6 +132,16 @@ def sample_rows(lg, sp, seed, q0, filt: bool, want_p: bool = False):
     return tok, mx.exp(mx.take_along_axis(z, tok[:, None], axis=-1)[:, 0] - mx.logsumexp(z, axis=-1))
 
 
+MSG_MIX2 = os.environ.get("MK_MSG_MIX2", "0") == "1"      # bit-equal, and no gain in a pass (not on its critical path)
+
+
+def msg_mix(sources, queries):
+    """The cross-pass messages of a looped layer: the depth mix of the previous loop's blocks under 4 queries. Through
+    the mix2 kernel (all its dot products behind one barrier: 7 us at one row) instead of the first mix kernel (a
+    barrier per dot product: 23 us); the same partial sums in the same order."""
+    return kn.mix2(sources, queries) if MSG_MIX2 else kn.mix(sources, queries)
+
+
 def rms(x, w=None):
     return mx.fast.rms_norm(x, w, EPS)
 
@@ -182,6 +197,9 @@ class Target:
             import mk_draft2
             d2 = json.loads((Path(self.draft2) / "config.json").read_text())["loopedtf_drafter"]
             self.taps = mk_draft2.last_loop_taps(tc, d2["feature_layers_per_loop"])
+            self.tap_layers = tuple(d2["feature_layers_per_loop"])
+            if os.environ.get("MK_TAPS"):       # experiment: other visits for the committed tokens' features
+                self.taps = tuple(int(v) for v in os.environ["MK_TAPS"].split(","))
         self.qthr, self.rthr = tc["qk_l2_clip_threshold"], tc["rel_l2_clip_threshold"]
         w = mx.load(str(Path(model_dir) / "model-00001-of-00001.safetensors"))
         g = lambda k: w["model.llm." + k]  # noqa: E731
@@ -252,6 +270,8 @@ class Target:
                 L["c_fg3"] = [L["cq_fg"], L["ck_fg"], L["cv_fg"]]
                 L["c_down1"], L["c_fg1"] = [L["cm_down"]], [L["cm_fg"]]
                 L["c_ft3"] = [mx.contiguous(f.T) for f in L["c_fg3"]]
+                L["c_down3s"] = mx.concatenate(L["c_down3"])
+                L["c_fg3s"] = mx.concatenate(L["c_fg3"])
                 L["c_ft1"] = [mx.contiguous(L["cm_fg"].T)]
             self.layers.append(L)
         keep = [self.embed, self.embed_norm, self.unembed, self.norm, self.out_query, self.msg_query]
@@ -455,12 +475,17 @@ class Target:
                     pass
                 elif GATE2:
                     hq, hk, hv = kn.gates2(hm, msgs, L["c_down3"], L["c_ft3"], L["anw3"], 0)
+                elif GATEM and K <= kn.GEMV_KMAX:
+                    hq, hk, hv = kn.gates_m(hm, msgs, L["c_down3s"], L["c_fg3s"], L["anw3"], 0)
                 else:
                     hq, hk, hv = kn.gates(hm, msgs, L["c_down3"], L["c_fg3"], L["anw3"], 0)
-        o = dense(L, "qgrs", hq)                                            # [K, 3072 + 3072 + 384 + 24]
+        if DENSE3 and K <= kn.GEMV_KMAX and "qgrs12" in L and not WHATIF_NO:
+            o, kk, vv = kn.gemv12_3(L["qgrs12"], L["wk12"], L["wv12"], hq, hk, hv)
+        else:
+            o = dense(L, "qgrs", hq)                                        # [K, 3072 + 3072 + 384 + 24]
+            kk = dense(L, "wk", hk)
+            vv = dense(L, "wv", hv)
         gate, sinks = o[:, 3072:6144], o[:, 6528:]
-        kk = dense(L, "wk", hk)
-        vv = dense(L, "wv", hv)
         q, rel, knew, vnew, w0, w1 = kn.qkv_post(L["full"], o, kk, vv, cw[0], cw[1], L["k_taps"], L["v_taps"], L["q_scale"],
                                                  L["r_scale"], self.qthr, self.rthr)
         if L["full"] and self.tau is not None:
@@ -532,30 +557,40 @@ class Target:
         return (o * mx.sigmoid(gate)).astype(mx.float16).view(mx.uint16)
 
     # ---------------------------------------------------------------------------------------------- the pass
-    def _pure(self, tokens, m_full, m_loc, kc, vc, kr, vr, cw, tok_only=False):
-        """The pass as a pure function of (tokens, position, state): what mx.compile traces, once per K."""
+    def _pure(self, tokens, m_full, m_loc, kc, vc, kr, vr, cw, tok_only=False, early=0):
+        """The pass as a pure function of (tokens, position, state): what mx.compile traces, once per K.
+        early = r > 0: a draft-only readout after r loop passes that exits through the suffix layers (reading the
+        committed tokens' K/V and conv windows of the visits it makes: the prefix, loops 1 .. r and the final suffix);
+        its rows are never committed. The features are the inputs of the draft's tap layers in loop r."""
         K = tokens.shape[0]
         meta = (m_full, m_loc)
+        passes = early if early else self.passes
+        taps = self.taps
+        if early:
+            n = len(self.core)
+            taps = tuple(t if t < self.core.start else t - (self.passes - early) * n for t in self.taps)
         h = rms(self.embed[tokens].astype(F32), self.embed_norm)
         knew, vnew, wins, feats = [], [], [], []
         blocks = []
         cs, ce = self.core.start, self.core.stop
-        a = 0
+        a = 0           # the visit whose state is read; v counts the visits this pass makes (taps)
+        v = 0
         for i in range(cs):
-            if a in self.taps: feats.append(h)
-            h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, None, meta, K, knew, vnew, wins); a += 1
+            if v in taps: feats.append(h)
+            h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, None, meta, K, knew, vnew, wins); a += 1; v += 1
         pre_h, pre_blocks = h, blocks
-        for lp in range(self.passes):
+        for lp in range(passes):
             if lp > 0:
                 bank_blocks, bank_part = blocks[len(pre_blocks) + 1:], rms(h)
                 h, blocks = pre_h, pre_blocks
             for j, i in enumerate(self.core):
-                msgs = kn.mix(bank_blocks + [bank_part], self.msg_query[j]) if lp > 0 else None
-                if a in self.taps: feats.append(h)
-                h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, msgs, meta, K, knew, vnew, wins); a += 1
+                msgs = msg_mix(bank_blocks + [bank_part], self.msg_query[j]) if lp > 0 else None
+                if v in taps: feats.append(h)
+                h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, msgs, meta, K, knew, vnew, wins); a += 1; v += 1
+        a = cs + self.passes * len(self.core)
         for i in range(ce, len(self.layers)):
-            if a in self.taps: feats.append(h)
-            h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, None, meta, K, knew, vnew, wins); a += 1
+            if v in taps: feats.append(h)
+            h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, None, meta, K, knew, vnew, wins); a += 1; v += 1
         fo16 = kn.mix2(blocks + [h], self.out_query[None], norm_in=True, wt=self.norm[None])[:, 0]
         if K >= WIDE_MIN:           # wide pass: the caller takes the token of the one row it needs (prefill())
             logits = fo16
@@ -566,7 +601,153 @@ class Target:
             z = kn.gemv(self.unembed, fo16, self.vocab)
             logits = mx.tanh(z * (1.0 / self.cap)) * self.cap
         feats.append(fo16.view(mx.float16).astype(F32))
+        if early:
+            return logits, feats
         return logits, feats, mx.stack(knew), mx.stack(vnew), [mx.stack([w[j] for w in wins]) for j in range(4)]
+
+    # ---------------------------------------------------------------------------------------------- staged pass
+    # The pass in two stages, for draft-and-verify in rounds (mk_draft2): stage A is the prefix and the first loop
+    # (visits 0 .. 17) of some rows, with a draft-only readout through the suffix; stage B is loops 2 .. 5 and the
+    # suffix of rows whose stage A is in hand. Every row goes through the statements of _pure with the same inputs
+    # (stage A's results are carried, not recomputed), so A then B gives each row the bits of the one pass.
+    def _lay(self, a, ci, i, h, blocks, msgs, meta, K, kc, vc, kr, vr, cw, knew, vnew, wins):
+        return self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[ci] for c in cw], a), self.layers[i], h, blocks, msgs, meta, K, knew, vnew, wins)
+
+    def _stage_a(self, tokens, m_full, m_loc, kc, vc, kr, vr, cwa, samp=None):
+        """tokens int32 [K] at positions m_full[0] ..; cwa: the conv windows [24, 3, d] of visits 0 .. 17 and of the 6
+        suffix visits (for the readout: provisional for rows not yet committed). -> (readout tokens [K], their probabilities, readout
+        features, carry [K, NC, D], K/V rows [24, K, 1024] x 2, windows [24, K + 3, d] x 4); the first 18 of the 24
+        are the pass's own visits 0 .. 17."""
+        K = tokens.shape[0]
+        meta = (m_full, m_loc)
+        h = rms(self.embed[tokens].astype(F32), self.embed_norm)
+        knew, vnew, wins, feats = [], [], [], []
+        blocks = []
+        cs, ce, n = self.core.start, self.core.stop, len(self.core)
+        tl = self.tap_layers
+        for i in range(cs):
+            if i in tl: feats.append(h)
+            h, blocks = self._lay(i, i, i, h, blocks, None, meta, K, kc, vc, kr, vr, cwa, knew, vnew, wins)
+        pre_h, pre_blocks = h, blocks
+        for j, i in enumerate(self.core):
+            if i in tl: feats.append(h)
+            h, blocks = self._lay(cs + j, cs + j, i, h, blocks, None, meta, K, kc, vc, kr, vr, cwa, knew, vnew, wins)
+        tail = blocks[len(pre_blocks) + 1:]
+        self._nc = (len(pre_blocks), len(tail))
+        carry = mx.stack([pre_h, h, feats[0]] + pre_blocks + tail, axis=1)
+        a0 = cs + self.passes * n
+        for i in range(ce, len(self.layers)):
+            if i in tl: feats.append(h)
+            h, blocks = self._lay(a0 + i - ce, cs + n + i - ce, i, h, blocks, None, meta, K, kc, vc, kr, vr, cwa, knew, vnew, wins)
+        fo16 = kn.mix2(blocks + [h], self.out_query[None], norm_in=True, wt=self.norm[None])[:, 0]
+        if samp is None:
+            tok, pr = self._readout(fo16)
+        else:
+            # a sampling request: the readout draws with the target's noise of each position (a shared-noise coupling,
+            # as the draft's), from its 8-bit logits and without the top_p / top_k cut (a draft: the verify decides)
+            lg = mx.tanh(kn.gemv8(self.un8, fo16) * (1.0 / self.cap)) * self.cap
+            tok, pr = sample_rows(lg, samp[0], samp[1], m_full[0:1] + 1, False, want_p=True)
+        tok = tok.astype(mx.int32)
+        feats.append(fo16.view(mx.float16).astype(F32))
+        return tok, pr, feats, carry, mx.stack(knew), mx.stack(vnew), [mx.stack([w[j] for w in wins]) for j in range(4)]
+
+    def _stage_b(self, carry, m_full, m_loc, kc, vc, kr, vr, cw, samp=None):
+        """carry [K, NC, D] of rows at positions m_full[0] ..; cw: the committed conv windows [72, 3, d] -> (greedy tokens
+        [K], the draft features, K/V rows [54, K, 1024] x 2, windows [54, K + 3, d] x 4) of visits 18 .. 71."""
+        K = carry.shape[0]
+        meta = (m_full, m_loc)
+        nb0, nt = self._nc
+        pre_h, h = carry[:, 0], carry[:, 1]
+        feats = [carry[:, 2]]
+        pre_blocks = [carry[:, 3 + i] for i in range(nb0)]
+        bank_blocks = [carry[:, 3 + nb0 + i] for i in range(nt)]
+        knew, vnew, wins = [], [], []
+        cs, ce, n = self.core.start, self.core.stop, len(self.core)
+        a = cs + n
+        blocks = None
+        for lp in range(1, self.passes):
+            if blocks is not None:
+                bank_blocks = blocks[len(pre_blocks) + 1:]
+            bank_part = rms(h)
+            h, blocks = pre_h, pre_blocks
+            for j, i in enumerate(self.core):
+                msgs = msg_mix(bank_blocks + [bank_part], self.msg_query[j])
+                if a in self.taps: feats.append(h)
+                h, blocks = self._lay(a, a, i, h, blocks, msgs, meta, K, kc, vc, kr, vr, cw, knew, vnew, wins); a += 1
+        for i in range(ce, len(self.layers)):
+            if a in self.taps: feats.append(h)
+            h, blocks = self._lay(a, a, i, h, blocks, None, meta, K, kc, vc, kr, vr, cw, knew, vnew, wins); a += 1
+        fo16 = kn.mix2(blocks + [h], self.out_query[None], norm_in=True, wt=self.norm[None])[:, 0]
+        if samp is None:
+            tok = kn.argmax_short(self.unembed, self.un8, fo16, self.vocab, self.cap)[0].astype(mx.int32)
+        else:           # the rows' tokens drawn from their exact logits: the statements of a sampling step
+            z = kn.gemv(self.unembed, fo16, self.vocab)
+            tok = sample_rows(mx.tanh(z * (1.0 / self.cap)) * self.cap, samp[0], samp[1], m_full[0:1] + 1, samp[2])[0]
+        feats.append(fo16.view(mx.float16).astype(F32))
+        return tok, feats, mx.stack(knew), mx.stack(vnew), [mx.stack([w[j] for w in wins]) for j in range(4)]
+
+    # ---------------------------------------------------------------------------------------------- readout argmax
+    # The readout's token (a draft) from a short list instead of a scan of the whole 8-bit unembedding (461 MB): the
+    # readout's final states lie almost in a subspace (768 principal directions of states the model produces on random
+    # tokens at load hold the exact argmax in the top 4096 scores for 99.7% or more of the states of prose, code and
+    # chat: tests/pca.py), so the scores come from the unembedding projected on it (154 MB, 8 bits) and the exact
+    # logits are computed for about SL_C tokens.
+    def fit_shortlist(self, r: int = 768, n_seq: int = 96):
+        import numpy as np
+        rng = np.random.default_rng(20261124)
+        self.reset()
+        F = []
+        for _ in range(n_seq):
+            f = self.early(mx.array(rng.integers(0, self.vocab, size=16).astype(np.int32)), 1)[1][-1]
+            mx.eval(f)
+            F.append(f)
+        F = mx.concatenate(F)
+        g = np.array(F.T @ F).astype(np.float64)
+        _, V = np.linalg.eigh(g)
+        P = mx.array(np.ascontiguousarray(V[:, -r:]).astype(np.float32))
+        un = self.unembed.view(mx.bfloat16)
+        parts = []
+        for s0 in range(0, self.vocab, 16384):
+            parts.append(un[s0:min(s0 + 16384, self.vocab)].astype(F32) @ P)
+            mx.eval(parts[-1])
+        self.sl_w = kn.quant8(mx.concatenate(parts))
+        self.sl_p = P
+        mx.eval(self.sl_p, *self.sl_w)
+        self.reset()
+
+    def _readout(self, fo16):
+        """fo16 uint16 (half bits) [K, D] -> (tokens [K], their probabilities [K]) of a draft-only readout."""
+        if getattr(self, "sl_w", None) is None:
+            return kn.argmax_short_p(self.unembed, self.un8, fo16, self.vocab, self.cap)
+        K = fo16.shape[0]
+        V = self.vocab
+        z = fo16.view(mx.float16).astype(F32) @ self.sl_p
+        sc = kn.gemv8(self.sl_w, kn.bits(z))                                                       # [K, V]
+        samp = sc[:, ::16]
+        kth = samp.shape[1] - SL_C // 16
+        thr = mx.partition(samp, kth, axis=-1)[:, kth:kth + 1]                                     # ~ the SL_C-th largest
+        flag = (sc >= thr).any(axis=0).astype(mx.uint8)
+        zx = kn._gemv_flag(inputs=[self.unembed, fo16, flag], template=[("D", 2304), ("N", V), ("K", K)], grid=((V + 31) // 32 * 32, 1, 1),
+                           threadgroup=(32, 1, 1), output_shapes=[(K, V)], output_dtypes=[F32])[0]
+        lg = mx.where(zx == -mx.inf, -mx.inf, mx.tanh(zx * (1.0 / self.cap)) * self.cap)
+        return mx.argmax(lg, axis=-1), mx.exp(lg.max(axis=-1) - mx.logsumexp(lg, axis=-1))
+
+    def cwa(self):
+        """The committed conv windows of the visits stage A makes: 0 .. 17 and the suffix."""
+        n0 = self.core.start + len(self.core)
+        return [mx.concatenate([c[:n0], c[self.napp - (len(self.layers) - self.core.stop):]]) for c in self.cw]
+
+    def early(self, tokens: mx.array, r: int = 1):
+        """Draft-only: the greedy tokens int32 [K] (and the draft features) of an r-loop readout of tokens at positions
+        pos .. pos + K - 1. Nothing is pending or committed."""
+        K = tokens.shape[0]
+        assert self.pos + K <= self.T and self.pos - self.base + K <= self.RECENT and self.un8 is not None
+        fn = self._fns.get(("early", K, r))
+        if fn is None:
+            pure = lambda tokens, m_full, m_loc, kc, vc, kr, vr, cw: self._pure(tokens, m_full, m_loc, kc, vc, kr, vr, cw, tok_only=True, early=r)  # noqa: E731
+            fn = self._fns[("early", K, r)] = mx.compile(pure) if COMPILE else pure
+        return fn(tokens, mx.array([self.pos, 0, self.base], dtype=mx.int32), mx.array([self.pos, 1024, self.base], dtype=mx.int32),
+                  self.kc, self.vc, self.kr, self.vr, self.cw)
 
     def _pure_tok(self, tokens, m_full, m_loc, kc, vc, kr, vr, cw):
         return self._pure(tokens, m_full, m_loc, kc, vc, kr, vr, cw, tok_only=True)

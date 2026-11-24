@@ -1,0 +1,22 @@
+thinkingmachines/TML-d24-varloop-5pass on m5max: 9.64 of 8 hours used, 0.00 left; 18 submissions
+  reference   2.326e+04  omlx-0.8.1-fork-mtp  (natural text at batch 1: 22422 us per token)
+  reference   2.114e+04  target: 1.10x the fastest general engine  (at batch 1)
+  best             9551  s0012  Final tree again (sampling-rounds code added, off): greedy path unchanged
+  s0001    0.71 h  valid      1.144e+04  Baseline: starting engine as given (2DSD 1-D draft, 5 passes)
+  s0002    1.33 h  valid      1.031e+04  Early-readout rounds: stage A (prefix+loop 1) readouts chain tokens, one stage B verifies
+  s0003    1.66 h  valid      1.023e+04  Rounds everywhere: readout confidence (online-calibrated) sets chain length, up to 12 rows
+  s0004    2.07 h  valid      1.007e+04  Cheaper drafter: own attention kernel, chunked top-64; no draft when it does not pay
+  s0005    2.54 h  valid      1.004e+04  Same engine as s0004 after 10 idle minutes (ring-mode draft kernel added, unused here)
+  s0006    2.87 h  valid           9888  Readout argmax from a state-PCA shortlist; q/k/v and gate projections in merged dispatches
+  s0007    3.22 h  valid           9789  Two-tier draft context (no whole-array rewrite per append); merged dispatches off
+  s0008    3.66 h  valid           9785  Plain pass when all 7 drafts are confident; cost constants as measured; flush guard
+  s0009    4.11 h  valid           9652  First copy proposal of a loop goes through a readout round (review) before stage B
+  s0010    4.93 h  valid           9727  Final source (s0009's engine; shortlist fit falls back on error): repeat measurement
+  s0011    5.49 h  valid           9656  Final tree (s0009's timed path; switched-off experiment code added): third measurement
+  s0012    6.07 h  valid           9551  Final tree again (sampling-rounds code added, off): greedy path unchanged
+  s0013    6.56 h  valid      1.113e+04  Control: the final engine with readout rounds off (plain cycles, the cheaper drafter)
+  s0014    6.74 h  valid           9657  Final engine (byte-identical to s0012), after the control: fifth measurement
+  s0015    7.25 h  valid      1.203e+04  Control: the final engine with copy proposals off (drafter and readout rounds only)
+  s0016    7.52 h  valid           9573  Final engine (byte-identical to s0012 / s0014), after the second control: sixth measurement
+  s0017    7.80 h  valid           9773  Experiment: readout shortlist of rank 512 instead of 768
+  s0018    7.99 h  valid           9793  Final engine (byte-identical to s0012 / s0014 / s0016): the run's last record

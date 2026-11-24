@@ -91,6 +91,8 @@ class Cal:
 
 
 class Draft:
+    tiers = False       # Draft2: the context K/V in two tiers (the position argument then carries dbase too)
+
     def __init__(self, model_dir: str, tg):
         cfg = json.loads((Path(model_dir) / "config.json").read_text())
         mc = cfg["mtp_config"]
@@ -191,6 +193,8 @@ class Draft:
         self._sfn = {}
         self._fn = None
         self.n1 = int(os.environ.get("MK_DRAFT_N1", "3"))     # Markov steps before the first look at the probabilities
+        self.review_r = int(os.environ.get("MK_REVIEW", "0"))
+        self.review_thr = float(os.environ.get("MK_REVIEW_THR", "0.2"))
         del w
         self.reset()
 
@@ -331,7 +335,7 @@ class Draft:
         frow = [mx.take(f, a, axis=0) for f in feats]
         anchor = mx.take(tgt, a, axis=0).astype(mx.int32)
         nxt = cposf[:1] + (a + 1).astype(F32)
-        d, p, state, prev, ctx, base = self._pure(anchor, mx.concatenate([nxt, cposf[1:]]) if self.ring else nxt, dkc2, dvc2, frow)
+        d, p, state, prev, ctx, base = self._pure(anchor, mx.concatenate([nxt, cposf[1:]]) if (self.ring or self.tiers) else nxt, dkc2, dvc2, frow)
         return tgt, feats, knew, vnew, wins, dkc2, dvc2, d, p, state, prev, ctx, base
 
     def _nod_pure(self, tokens, m_full, m_loc, kc, vc, kr, vr, cw, dkc, dvc, cposf):
@@ -358,7 +362,7 @@ class Draft:
             frow = [mx.take(x, a, axis=0) for x in feats]
             anchor = mx.take(tgt, a, axis=0).astype(mx.int32)
             nxt = cposf[:1] + (a + 1).astype(F32)
-            d, p, state, prev, ctx, base = self._pure(anchor, mx.concatenate([nxt, cposf[1:]]) if self.ring else nxt, dkc2, dvc2, frow,
+            d, p, state, prev, ctx, base = self._pure(anchor, mx.concatenate([nxt, cposf[1:]]) if (self.ring or self.tiers) else nxt, dkc2, dvc2, frow,
                                                       samp=(sp, seed, filt))
             return tgt, feats, knew, vnew, wins, dkc2, dvc2, d, p, state, prev, ctx, base, nxt.astype(mx.int32) + 1 + self.n1
         return f
@@ -463,10 +467,23 @@ class Draft:
         samp = act.get("samp")      # None: greedy; else the request's sampling (the same cycle, drawn tokens for argmax ones)
         t0 = time.perf_counter()
         syncs = 1
+        if self.tiers:
+            self.maybe_flush()
         # copy proposals: 7 drafts, or 15 (a 16-row pass) while the previous copy cycle was accepted in full
         wide = self.ng_wide and act.get("ng_full", False) and left - 1 >= 15
         cont = ngram(act["hist"], self.ng_min, 15 if wide else nd) if self.ng_min > 0 else None
         dp = act.pop("draft", None)
+        nod = act.pop("nodraft", False)
+        m_ok = getattr(self, "rounds", 0) > 0 and left >= 3 and act.get("cal") is not None and (samp is None or getattr(self, "rounds_samp", False))
+        if nod and cont is None and m_ok:
+            return self._cycle_m(eng, act, left, None, t0, 0, samp=samp)      # no draft was made for this anchor: readout rounds
+        if (cont is not None and not wide and getattr(self, "copy_review", False) and samp is None and getattr(self, "rounds", 0) > 0
+                and left >= 3 and act.get("cal") is not None):
+            # a copy proposal not yet proven (the first of a loop): its tokens as the drafts of a readout round, which
+            # drops a wrong copy at a third of a verified row's cost and goes on with the readout's token
+            cnt["ngram_cycles"] = cnt.get("ngram_cycles", 0) + 1
+            cnt["copy_rounds"] = cnt.get("copy_rounds", 0) + 1
+            return self._cycle_m(eng, act, left, (np.asarray(cont, dtype=np.int64), None), t0, 0, copy=True)
         if cont is not None and self.ng_agree and dp is not None and int(dp[0][0]) != int(cont[0]):
             # the DSpark draft for this anchor is in hand and its first token contradicts the copy: a copy proposal is
             # then right about its first token about one time in three (tests/replay3.py); draft with DSpark
@@ -492,6 +509,8 @@ class Draft:
                 # a row pays when its chance of yielding a token, per ms of row, beats the request's recent
                 # tokens per ms: threshold = row ms x tokens per ms (hard prose ~0.23, easy text ~0.5)
                 thr = min(self.thr_hi, max(self.thr_lo, self.row_ms * 1e-3 * act["ema_n"] / act["ema_t"]))
+            if self.review_r > 0 and samp is None:
+                thr = self.review_thr       # a reviewed row costs a third of a verified one
             if cal is not None:
                 kd, pr = cal.depth(p, thr)
                 want_more = kd == len(p)
@@ -511,6 +530,29 @@ class Draft:
                 # rows worth verifying: the draft's probabilities are overconfident (cumulative 0.5 is accepted
                 # ~25-40%), a row costs ~2.3 ms and a token is worth ~10 ms
                 kd = max(self.kmin, int((cum >= self.theta).cumprod().sum()))
+        if cont is None and m_ok and cal is not None and kd < self.m_kd:
+            # the draft is not worth many rows here: rounds of early readouts instead (mk_draft2)
+            return self._cycle_m(eng, act, left, (d, p), t0, syncs, samp=samp)
+        reviewed = False
+        if cont is None and samp is None and self.review_r > 0 and left > 1:
+            # review: an early readout (review_r loops, exit through the suffix) of the anchor and the first kr drafts.
+            # Row j's token is the early model's choice after draft j: the drafts it confirms stay, the first one it
+            # contradicts is replaced by its choice and the rest dropped. A proposal only: the verify pass decides.
+            kr = max(0, min(kd, left - 2, NB - 2))
+            e = np.array(tg.early(mx.array(np.concatenate([[act["last"]], d[:kr]]).astype(np.int32)), self.review_r)[0])
+            syncs += 1
+            m = 0
+            while m < kr and int(e[m]) == int(d[m]):
+                m += 1
+            if cal is not None:
+                for j in range(min(m + 1, kr)):
+                    cal.upd(j, float(p[j]), j < m)
+            d = np.concatenate([d[:m], e[m:m + 1]]).astype(np.int64)
+            kd = m + 1
+            reviewed = True
+            cnt["reviews"] = cnt.get("reviews", 0) + 1
+            cnt["review_rows"] = cnt.get("review_rows", 0) + kr + 1
+            cnt["review_kept"] = cnt.get("review_kept", 0) + m
         t1 = time.perf_counter()
         kd = max(0, min(kd, left - 1))
         K = 1 + kd
@@ -536,7 +578,10 @@ class Draft:
         if cont is None or not self.rate_dspark:
             act["ema_t"] = act.get("ema_t", 0.0) * self.ema + dt
             act["ema_n"] = act.get("ema_n", 0.0) * self.ema + n_acc
-        if cont is None and act.get("cal") is not None and self.policy in ("cal", "cala"):
+        if reviewed:
+            cnt["review_acc"] = cnt.get("review_acc", 0) + a
+            cnt["review_sent"] = cnt.get("review_sent", 0) + kd
+        elif cont is None and act.get("cal") is not None and self.policy in ("cal", "cala"):
             for j in range(min(a + 1, kd)):
                 act["cal"].upd(j, float(p[j]), j < a)
         self.kc, self.vc = out[5], out[6]
@@ -556,6 +601,8 @@ class Draft:
         cnt["host_syncs"] += syncs
         act["ng_full"] = cont is not None and a == kd and kd >= nd
         if cont is not None:
+            cnt["ngram_rows"] = cnt.get("ngram_rows", 0) + K
+            cnt["ngram_full"] = cnt.get("ngram_full", 0) + int(a == kd)
             cnt["ngram_tokens"] = cnt.get("ngram_tokens", 0) + n_acc
             if K == 16:
                 cnt["wide_cycles"] = cnt.get("wide_cycles", 0) + 1

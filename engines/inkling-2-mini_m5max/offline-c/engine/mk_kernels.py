@@ -1026,14 +1026,73 @@ def _make_mix2(N: int, Q: int, norm_in: bool, pout: bool, wout: bool):
                                 output_names=onames, source=src, header=_TGHDR2)
 
 
+def _make_mix2f(N: int, Q: int, norm_in: bool, pout: bool, wout: bool):
+    """_make_mix2 with the softmax weights of a row computed once: in _make_mix2 each of the 576 threads adds up the
+    18 partials of all N * Q dot products and takes N * Q exponentials, all to the same values; here thread j does it
+    for query j and the others read the N * Q weights after one more barrier. The same statements on the same
+    operands, so the same bits (tests/mixeq.py); the kernel's own latency, which is what a pass waits for, is lower."""
+    names = [f"b{i}" for i in range(N)]
+    L = N - 1
+    load = "\n".join(f"    float4 v{i} = *((const device float4*)({n} + row * 2304 + d4));" for i, n in enumerate(names))
+    nred = N * Q + (1 if norm_in else 0) + (Q if wout else 0)
+    pre = ""
+    if norm_in:
+        pre = f"""
+    float hh = tgsum(dot4(v{L}, v{L}), buf + {N * Q * 18}, lane, sg);
+    v{L} = v{L} * metal::precise::rsqrt(hh * (1.0f / 2304.0f) + 1e-6f);"""
+    dots = "\n".join(f"    tgput(dot4(v{i}, *((const device float4*)(qs + {j} * 2304 + d4))), buf + {(i * Q + j) * 18}, lane, sg);"
+                     for i in range(N) for j in range(Q))
+    dots += "\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    dots += f"    if (tid < {Q}u) {{\n"
+    dots += "\n".join(f"      float s{i} = tgget(buf + ({i * Q} + tid) * 18);" for i in range(N)) + "\n"
+    dots += "      float m = s0;\n" + "".join(f"      m = max(m, s{i});\n" for i in range(1, N))
+    dots += "".join(f"      float e{i} = metal::precise::exp((s{i} - m) * SCALE);\n" for i in range(N))
+    dots += "      float z = e0" + "".join(f" + e{i}" for i in range(1, N)) + ";\n"
+    dots += "".join(f"      wts[tid * {N} + {i}] = e{i} / z;\n" for i in range(N))
+    dots += "    }\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    outs = ""
+    for j in range(Q):
+        outs += f"    {{ float4 o = v0 * wts[{j * N}];\n"
+        for i in range(1, N):
+            outs += f"      o = fma(v{i}, float4(wts[{j * N + i}]), o);\n"
+        if wout:
+            outs += f"""      float oo = tgsum(dot4(o, o), buf + {(N * Q + (1 if norm_in else 0) + j) * 18}, lane, sg);
+      o = o * metal::precise::rsqrt(oo * (1.0f / 2304.0f) + 1e-6f) * *((const device float4*)(wt + {j} * 2304 + d4));
+      *((device half4*)(y + (row * {Q} + {j}) * 2304 + d4)) = half4(o); }}\n"""
+        else:
+            outs += f"      *((device float4*)(out + (row * {Q} + {j}) * 2304 + d4)) = o; }}\n"
+    if pout:
+        outs += f"    *((device float4*)(pn + row * 2304 + d4)) = v{L};\n"
+    src = f"""
+    constexpr float SCALE = 0.020833333333333332f;      // 2304 ^ -0.5
+    uint row = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint d4 = tid * 4;
+    threadgroup float buf[{nred * 18}];
+    threadgroup float wts[{N * Q}];
+{load}
+{pre}
+{dots}
+{outs}
+"""
+    onames = ([] if wout else ["out"]) + (["pn"] if pout else []) + (["y"] if wout else [])
+    return mx.fast.metal_kernel(name=f"mk_mix2f_{N}_{Q}_{int(norm_in)}{int(pout)}{int(wout)}", input_names=names + ["qs"] + (["wt"] if wout else []),
+                                output_names=onames, source=src, header=_TGHDR2)
+
+
 _mix2 = {}
+import os as _os5
+MIXF = _os5.environ.get("MK_MIXF", "0") == "1"       # bit-equal and 2x faster alone, no gain in a pass (journal): off
 
 
-def mix2(sources: list, queries: mx.array, norm_in: bool = False, pout: bool = False, wt: mx.array | None = None):
+def mix2(sources: list, queries: mx.array, norm_in: bool = False, pout: bool = False, wt: mx.array | None = None, fast: bool | None = None):
     """Returns the kernel's outputs in the order (out or y, [pn]): out float32 [K, Q, D] / y uint16 [K, Q, D], pn [K, D]."""
     N, Q, K = len(sources), queries.shape[0], sources[0].shape[0]
-    key = (N, Q, norm_in, pout, wt is not None)
-    k = _mix2.get(key) or _mix2.setdefault(key, _make_mix2(*key))
+    fast = MIXF if fast is None else fast
+    key = (N, Q, norm_in, pout, wt is not None, fast)
+    k = _mix2.get(key) or _mix2.setdefault(key, (_make_mix2f if fast else _make_mix2)(*key[:5]))
     shapes, dts = [], []
     if wt is None:
         shapes.append((K, Q, 2304)); dts.append(mx.float32)
@@ -1265,6 +1324,23 @@ def argmax_short(w16, w8, x16: mx.array, n_out: int, cap: float):
                    threadgroup=(32, 1, 1), output_shapes=[(K, n_out)], output_dtypes=[mx.float32])[0]
     logits = mx.where(z == -mx.inf, -mx.inf, mx.tanh(z * (1.0 / cap)) * cap)
     return mx.argmax(logits, axis=-1), flag.astype(mx.int32).sum()
+
+
+def argmax_short_p(w16, w8, x16: mx.array, n_out: int, cap: float):
+    """As argmax_short(), for draft-only readouts: also the probability of each row's largest logit under the 8-bit
+    copy's logits (softcapped), float32 [K]: a confidence for the depth policy, not part of any token."""
+    K, D = x16.shape
+    approx = gemv8(w8, x16)                                                    # [K, n_out]
+    l1 = mx.abs(x16.view(mx.float16).astype(mx.float32)).sum(axis=-1, keepdims=True)
+    eps = (0.51 * l1) * w8[1][None, :] + 0.02
+    lo = (approx - eps).max(axis=-1, keepdims=True)
+    flag = ((approx + eps) >= lo).any(axis=0).astype(mx.uint8)                 # [n_out]
+    z = _gemv_flag(inputs=[w16, x16, flag], template=[("D", D), ("N", n_out), ("K", K)], grid=((n_out + 31) // 32 * 32, 1, 1),
+                   threadgroup=(32, 1, 1), output_shapes=[(K, n_out)], output_dtypes=[mx.float32])[0]
+    logits = mx.where(z == -mx.inf, -mx.inf, mx.tanh(z * (1.0 / cap)) * cap)
+    la = mx.tanh(approx * (1.0 / cap)) * cap
+    pr = mx.exp(la.max(axis=-1) - mx.logsumexp(la, axis=-1))
+    return mx.argmax(logits, axis=-1), pr
 
 
 # draft-only 8-bit GEMV for short rows (the Markov fold, D = 256, one input row): one thread per output instead of
@@ -1989,3 +2065,158 @@ def gumbel_add(z: mx.array, seed: mx.array, q0: mx.array) -> mx.array:
     K, N = z.shape
     return _gumbel(inputs=[z, seed, q0], template=[("N", N)], grid=(K * N, 1, 1), threadgroup=(256, 1, 1),
                    output_shapes=[(K, N)], output_dtypes=[mx.float32])[0]
+
+
+# ------------------------------------------------------------------------------------------------- merged dispatches
+# Dispatches that do not depend on each other, in one: the q | gate | rel | sink, k and v projections of a layer (three
+# 12-bit GEMVs on three inputs) and the three message gates' two projections. Each output row runs the statements of
+# its own kernel (mk_gemv12, mk_gemv, mk_gemv_small) on the same operands, so the bits are those of the separate
+# dispatches; what goes is two (and four) dispatch latencies per layer visit.
+_GEMV12_3 = f"""
+    uint n = thread_position_in_grid.x / 32;
+    uint lane = thread_index_in_simdgroup;
+    const device uchar* w = w0;
+    const device uint* lo = lo0;
+    const device int* rawidx = ri0;
+    const device ushort* raw = raw0;
+    const device ushort* x = x0;
+    uint nn = n;
+    if (n >= N0 + N1) {{ w = w2; lo = lo2; rawidx = ri2; raw = raw2; x = x2; nn = n - (N0 + N1); }}
+    else if (n >= N0) {{ w = w1; lo = lo1; rawidx = ri1; raw = raw1; x = x1; nn = n - N0; }}
+    float4 acc[K];
+    for (int k = 0; k < K; k++) acc[k] = float4(0.0f);
+    int ri = rawidx[nn];
+    if (ri < 0) {{
+        const device uchar* wr = w + size_t(nn) * (D / 4 * 6);
+        uint base = lo[nn];
+        for (int i = 0; i < D / 128; i++) {{
+            int g = i * 32 + lane;
+            uint4 mv = uint4(*((const device packed_uchar4*)(wr + g * 6)));
+            uint ev = *((const device ushort*)(wr + g * 6 + 4));
+            uint4 e4 = (uint4(ev) >> uint4(0u, 4u, 8u, 12u)) & 15u;
+            float4 wf = as_type<float4>(((mv & 0x80u) << 24) | ((mv & 0x7Fu) << 16) | ((e4 << 23) + base));
+            for (int k = 0; k < K; k++) {{
+                float4 xv = {hf4('x + k * D + g * 4')};
+                acc[k] = fma(wf, xv, acc[k]);
+            }}
+        }}
+    }} else {{
+        const device ushort* wr = raw + size_t(ri) * D;
+        for (int i = 0; i < D / 128; i++) {{
+            int idx = (i * 32 + lane) * 4;
+            float4 wf = {bf4('wr + idx')};
+            for (int k = 0; k < K; k++) {{
+                float4 xv = {hf4('x + k * D + idx')};
+                acc[k] = fma(wf, xv, acc[k]);
+            }}
+        }}
+    }}
+    for (int k = 0; k < K; k++) {{
+        float4 a = acc[k];
+        float s = simd_sum((a.x + a.y) + (a.z + a.w));
+        if (lane == 0) out[k * N + n] = s;
+    }}
+"""
+_gemv12_3 = mx.fast.metal_kernel(name="mk_gemv12_3", input_names=["w0", "lo0", "ri0", "raw0", "w1", "lo1", "ri1", "raw1", "w2", "lo2", "ri2", "raw2",
+                                                                    "x0", "x1", "x2"], output_names=["out"], source=_wi(_GEMV12_3))
+
+
+def gemv12_3(p0, p1, p2, x0, x1, x2):
+    """Three pack12 matrices on three inputs uint16 [K, D] (K <= GEMV_KMAX) -> the three float32 results, the bits of
+    gemv12() on each."""
+    N0, N1, N2 = p0[0].shape[0], p1[0].shape[0], p2[0].shape[0]
+    D = p0[0].shape[1] // 6 * 4
+    K = x0.shape[0]
+    N = N0 + N1 + N2
+    o = _gemv12_3(inputs=list(p0) + list(p1) + list(p2) + [x0, x1, x2], template=[("D", D), ("N", N), ("N0", N0), ("N1", N1), ("K", K)],
+                  grid=(N * 32, 1, 1), threadgroup=(256 if N % 8 == 0 else 32, 1, 1), output_shapes=[(K, N)], output_dtypes=[mx.float32])[0]
+    return o[:, :N0], o[:, N0:N0 + N1], o[:, N0 + N1:]
+
+
+_GEMV_G = f"""
+    uint n = thread_position_in_grid.x / 32;
+    uint lane = thread_index_in_simdgroup;
+    uint g = n / NG;
+    const device ushort* x = g == 0 ? x0 : (g == 1 ? x1 : x2);
+    float4 acc[K];
+    for (int k = 0; k < K; k++) acc[k] = float4(0.0f);
+    const device ushort* wr = w + size_t(n) * D;
+    for (int i = 0; i < D / 128; i++) {{
+        int idx = (i * 32 + lane) * 4;
+        float4 wf = {bf4('wr + idx')};
+        for (int k = 0; k < K; k++) {{
+            float4 xv = {hf4('x + k * D + idx')};
+            acc[k] = fma(wf, xv, acc[k]);
+        }}
+    }}
+    for (int k = 0; k < K; k++) {{
+        float4 a = acc[k];
+        float s = simd_sum((a.x + a.y) + (a.z + a.w));
+        if (lane == 0) out[k * N + n] = s;
+    }}
+"""
+_gemv_g = mx.fast.metal_kernel(name="mk_gemv_g3", input_names=["w", "x0", "x1", "x2"], output_names=["out"], source=_wi(_GEMV_G))
+
+_GEMV_SG = """
+    uint gi = thread_position_in_grid.x;
+    uint k = gi / N, n = gi % N;
+    uint g = n / NF;
+    const device float* xr = x + (k * G + g) * D;
+    float acc = 0.0f;
+    for (int d = 0; d < D / 4 * 4; d += 4) {
+        float4 wv = *((const device float4*)(w + n * D + d));
+        float4 xv = *((const device float4*)(xr + d));
+        acc = fma(wv.x, xv.x, acc);
+        acc = fma(wv.y, xv.y, acc);
+        acc = fma(wv.z, xv.z, acc);
+        acc = fma(wv.w, xv.w, acc);
+    }
+    for (int d = D / 4 * 4; d < D; d++) acc = fma(w[n * D + d], xr[d], acc);
+    out[gi] = acc;
+"""
+_gemv_sg = mx.fast.metal_kernel(name="mk_gemv_small_g", input_names=["w", "x"], output_names=["out"], source=_GEMV_SG)
+
+
+def _make_gate_post_m(G: int, QH: int, M0: int):
+    """_make_gate_post with the G forget | gain arrays as one [K, G * 4608]."""
+    src = f"""
+    uint grp = threadgroup_position_in_grid.x;
+    uint row = grp / {G}, g = grp % {G};
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint d4 = tid * 4;
+    threadgroup float buf[18];
+    const device float* fg = fga + (row * {G} + g) * 4608;
+    float4 hv = *((const device float4*)(h + (row * {QH} + min(g, {QH - 1}u)) * 2304 + d4));
+    float4 mv = *((const device float4*)(msgs + (row * 4 + {M0} + g) * 2304 + d4));
+    float4 f = metal::precise::tanh(*((const device float4*)(fg + d4)));
+    float4 gn = metal::precise::tanh(*((const device float4*)(fg + 2304 + d4)));
+    float4 v = (1.0f - f) * hv + gn * mv;
+    float vv = tgsum(dot4(v, v), buf, lane, sg);
+    half4 o = half4(v * metal::precise::rsqrt(vv * (1.0f / 2304.0f) + 1e-6f) * *((const device float4*)(wt + g * 2304 + d4)));
+""" + "".join(f"""
+    if (g == {i}) *((device half4*)(y{i} + row * 2304 + d4)) = o;""" for i in range(G))
+    return mx.fast.metal_kernel(name=f"mk_gate_post_m_{G}_{QH}_{M0}", input_names=["h", "msgs", "wt", "fga"],
+                                output_names=[f"y{i}" for i in range(G)], source=src, header=_TGHDR)
+
+
+_gpost_m = {}
+
+
+def gates_m(h, msgs, down_s, fg_s, wt, m0: int) -> list:
+    """gates() for G = 3 with the three down projections in one dispatch and the three forget | gain projections in
+    one: down_s uint16 [3 * 64, 4608] and fg_s float32 [3 * 4608, 64] are the three matrices stacked."""
+    K, QH = h.shape[0], h.shape[1]
+    G = 3
+    key = (G, QH, m0)
+    kp = _gpre.get(key) or _gpre.setdefault(key, _make_gate_pre(*key))
+    kq = _gpost_m.get(key) or _gpost_m.setdefault(key, _make_gate_post_m(*key))
+    st = kp(inputs=[h, msgs], grid=(K * G * 576, 1, 1), threadgroup=(576, 1, 1), output_shapes=[(K, 4608)] * G,
+            output_dtypes=[mx.uint16] * G)
+    dn = _gemv_g(inputs=[down_s] + list(st), template=[("D", 4608), ("N", G * 64), ("NG", 64), ("K", K)], grid=(G * 64 * 32, 1, 1),
+                 threadgroup=(256, 1, 1), output_shapes=[(K, G * 64)], output_dtypes=[mx.float32])[0]
+    fg = _gemv_sg(inputs=[fg_s, dn], template=[("D", 64), ("N", G * 4608), ("NF", 4608), ("G", G)], grid=(K * G * 4608, 1, 1),
+                  threadgroup=(32, 1, 1), output_shapes=[(K, G * 4608)], output_dtypes=[mx.float32])[0]
+    return kq(inputs=[h, msgs, wt, fg], grid=(K * G * 576, 1, 1), threadgroup=(576, 1, 1), output_shapes=[(K, 2304)] * G,
+              output_dtypes=[mx.uint16] * G)
