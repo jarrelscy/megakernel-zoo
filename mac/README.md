@@ -90,6 +90,20 @@ mkserve serve thinkingmachines/Inkling-2-Mini --max-context 32768
 
 All of `mkserve`'s options are in [`mkserve/README.md`](../mkserve/README.md).
 
+## Desktop widget
+
+`mac/widget` is a small window for the desktop that reads `GET /api/status` from `mkserve serve` (or oMLX) every 2
+seconds: the model and its loop passes, whether the draft is on, requests, live decode and prefill speed graphs, cache
+reuse, memory and GPU. Build it with the Command Line Tools and open it:
+
+```bash
+mac/widget/build.sh                      # builds ~/Applications/Inkling Widget.app
+open ~/Applications/Inkling\ Widget.app
+```
+
+Drag it to move it; right-click for "Keep on top" and "Quit". For another server,
+`defaults write ai.omlx.inkling-widget url http://<host>:8000/api/status`.
+
 ## Why it is fast
 
 A general engine has to run every model. This one runs a single checkpoint, so each of the following is fixed for
