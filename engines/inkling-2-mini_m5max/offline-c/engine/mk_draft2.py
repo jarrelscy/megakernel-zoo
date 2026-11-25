@@ -175,6 +175,21 @@ class CalR:
         self.a[b] = self.a[b] * self.decay + (1.0 if ok else 0.0)
 
 
+def mask_vector(d: Path, mask_id: int):
+    """The learned mask vector [2304] float32, from mask_embedding.npy, else from mask_embedding.pt read without PyTorch:
+    the .pt file is a zip whose only tensor storage (data/0) holds the vector's 2,304 BF16 values, little-endian."""
+    import numpy as np
+    if (d / "mask_embedding.npy").exists():
+        return np.load(str(d / "mask_embedding.npy")).astype(np.float32)
+    import zipfile
+    with zipfile.ZipFile(d / "mask_embedding.pt") as z:
+        names = [n for n in z.namelist() if n.endswith("/data/0")]
+        assert len(names) == 1, f"mask_embedding.pt holds {len(names)} tensors, not 1"
+        raw = np.frombuffer(z.read(names[0]), dtype="<u2")
+    assert raw.size == 2304, f"mask_embedding.pt holds {raw.size} values, not 2,304"
+    return (raw.astype(np.uint32) << 16).view(np.float32)
+
+
 class Draft2(md.Draft):
     NL = 5
 
@@ -250,14 +265,7 @@ class Draft2(md.Draft):
         self.fc = w["fc.weight"]                                                                     # [2304, 5 * 2304] bf16
         self.hidden_norm = f32("hidden_norm.weight")
         self.norm = f32("norm.weight")
-        if (d / "mask_embedding.npy").exists():        # the vector of mask_embedding.pt, saved without PyTorch's format
-            import numpy as np
-            self.mask_embed = mx.array(np.load(str(d / "mask_embedding.npy")).astype("float32"))
-        else:
-            import torch
-            m = torch.load(str(d / "mask_embedding.pt"), map_location="cpu", weights_only=True)
-            assert int(m["mask_token_id"]) == cfg["dflash_config"]["mask_token_id"]
-            self.mask_embed = mx.array(m["embedding"].float().numpy())
+        self.mask_embed = mx.array(mask_vector(d, cfg["dflash_config"]["mask_token_id"]))
         self.w1 = w["markov_head.markov_w1.weight"]                                                  # [V, 256] bf16
         w2 = w["markov_head.markov_w2.weight"]                                                       # [V, 256] bf16
         self.w2b = w2                                                                                # rows gathered by candidate
