@@ -381,17 +381,19 @@ class Target:
             self.kc[a][0, b:p] = self.kr[a, :p - b]
             self.vc[a][0, b:p] = self.vr[a, :p - b]
 
-    def prefill(self, toks, K: int, want_feats: bool = False):
+    def prefill(self, toks, K: int, want_feats: bool = False, emb=None):
         """One wide pass over the n = len(toks) prompt tokens at positions pos .. pos + n - 1, padded to K rows (rows
         after the n-th see the real ones, never the other way round, and are dropped); commits the n rows. -> (greedy
-        token after the last one, int32 [1], lazy; the draft features of the K rows, or None)."""
+        token after the last one, int32 [1], lazy; the draft features of the K rows, or None).
+        emb = (rows float32 [K, D], use bool [K, 1]): rows given as input embeddings in place of their tokens' (the
+        embedding norm already applied, as Inkling's own embedding layer outputs them), e.g. projected audio."""
         n = len(toks)
         assert WIDE_MIN <= K and n <= K and self.pos + K <= self.T + 8
         self.flush()
         tokens = mx.array(list(toks) + [0] * (K - n), dtype=mx.int32)
         m_full = mx.array([self.pos, 0, self.pos], dtype=mx.int32)
         m_loc = mx.array([self.pos, 1024, self.pos], dtype=mx.int32)
-        fo16, feats, knew, vnew, wins = self._pure(tokens, m_full, m_loc, self.kc, self.vc, self.kr, self.vr, self.cw)
+        fo16, feats, knew, vnew, wins = self._pure(tokens, m_full, m_loc, self.kc, self.vc, self.kr, self.vr, self.cw, emb=emb)
         self.last_feats = feats
         if self.un8 is not None:
             tok = kn.argmax_short(self.unembed, self.un8, fo16[n - 1:n], self.vocab, self.cap)[0].astype(mx.int32)
@@ -557,7 +559,7 @@ class Target:
         return (o * mx.sigmoid(gate)).astype(mx.float16).view(mx.uint16)
 
     # ---------------------------------------------------------------------------------------------- the pass
-    def _pure(self, tokens, m_full, m_loc, kc, vc, kr, vr, cw, tok_only=False, early=0):
+    def _pure(self, tokens, m_full, m_loc, kc, vc, kr, vr, cw, tok_only=False, early=0, emb=None):
         """The pass as a pure function of (tokens, position, state): what mx.compile traces, once per K.
         early = r > 0: a draft-only readout after r loop passes that exits through the suffix layers (reading the
         committed tokens' K/V and conv windows of the visits it makes: the prefix, loops 1 .. r and the final suffix);
@@ -570,6 +572,8 @@ class Target:
             n = len(self.core)
             taps = tuple(t if t < self.core.start else t - (self.passes - early) * n for t in self.taps)
         h = rms(self.embed[tokens].astype(F32), self.embed_norm)
+        if emb is not None:
+            h = mx.where(emb[1], emb[0], h)
         knew, vnew, wins, feats = [], [], [], []
         blocks = []
         cs, ce = self.core.start, self.core.stop

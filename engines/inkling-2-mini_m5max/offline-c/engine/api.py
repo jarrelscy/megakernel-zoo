@@ -55,6 +55,8 @@ class Engine:
         self.cached = []            # the tokens whose K/V the target holds, by position (valid up to tg.pos)
         self._stale = False         # reset() was called: the state is kept until the next sequence shows its first tokens
         self.request_info = {}      # rid -> {"cached_tokens": prompt tokens kept from the cache} (mkserve reads and removes it)
+        self.embeds = {}            # rid -> (start, rows): input embeddings for part of a waiting request's prompt
+        self._sentinel = 0          # stand-ins for embedding positions in the cached token list: never match a prompt
         self.load_seconds = time.time() - t0
         self._warm()
 
@@ -177,20 +179,29 @@ class Engine:
         s = sampling if hasattr(sampling, "sp") else self._sampling(sampling)
         return int(mk_target.sample_rows(logits.reshape(1, -1), s.sp, s.seed, mx.array([q], dtype=mx.int32), s.filt)[0].item())
 
-    def submit(self, rid, prompt, n, sampling=None) -> None:
+    def submit(self, rid, prompt, n, sampling=None, embeds=None) -> None:
+        """embeds = (start, float32 [N, D]): prompt positions start .. start + N - 1 take these rows as their input
+        embeddings (the norm applied, as Inkling's embedding layer outputs them), e.g. projected audio; the prompt
+        holds any valid token there. They are never reused from the prefix cache."""
         prompt, n = [int(t) for t in prompt], int(n)
+        if embeds is not None:
+            start, rows = int(embeds[0]), np.asarray(embeds[1], dtype=np.float32)
+            if rows.ndim != 2 or rows.shape[1] != 2304 or start < 0 or start + rows.shape[0] > len(prompt):
+                raise ValueError(f"request {rid!r}: embeddings {rows.shape} at {start} do not fit the prompt")
+            self.embeds[rid] = (start, rows)
         if len(prompt) < 1 or n < 1 or len(prompt) + n - 1 > self.max_context:
             raise ValueError(f"request {rid!r}: prompt {len(prompt)} + {n} new tokens exceeds {self.max_context} positions")
         if min(prompt) < 0 or max(prompt) >= 201024:
             raise ValueError(f"request {rid!r}: token id out of range")
         self.pending.append((rid, prompt, n, self._sampling(sampling)))
 
-    def _prefill(self, prompt):
+    def _prefill(self, prompt, embeds=None):
         """The prompt in wide passes of up to PF_CHUNK rows (the last few tokens, if fewer than 9 remain, in a pass of
-        the step's kernels); returns the first new token (lazy)."""
+        the step's kernels); returns the first new token (lazy). embeds = (start, rows) relative to this prompt: every
+        pass is then a wide one, so the rows go in where the token embeddings would."""
         tg = self.tg
         i, last = 0, None
-        while mk_target.PREFILL != "off" and len(prompt) - i > 8:
+        while mk_target.PREFILL != "off" and (len(prompt) - i > 8 or (embeds is not None and i < len(prompt))):
             n = min(PF_CHUNK, len(prompt) - i)
             K = next(k for k in PF_BUCKETS if k >= n)
             if tg.pos + K > tg.T + 8:          # at the end of the context: no padding past it
@@ -198,7 +209,17 @@ class Engine:
                     break
                 K = n = max(k for k in PF_BUCKETS if k <= n)
             p = tg.pos
-            last, f = tg.prefill(prompt[i:i + n], K, want_feats=self.draft is not None)
+            emb = None
+            if embeds is not None:
+                s0, rows = embeds
+                lo, hi = max(i, s0), min(i + n, s0 + rows.shape[0])
+                if lo < hi:
+                    block = np.zeros((K, rows.shape[1]), dtype=np.float32)
+                    use = np.zeros((K, 1), dtype=bool)
+                    block[lo - i:hi - i] = rows[lo - s0:hi - s0]
+                    use[lo - i:hi - i] = True
+                    emb = (mx.array(block), mx.array(use))
+            last, f = tg.prefill(prompt[i:i + n], K, want_feats=self.draft is not None, emb=emb)
             self._last_row = n - 1
             if self.draft is not None:
                 self.draft.append(f, p, n)
@@ -238,6 +259,7 @@ class Engine:
         """Optional (mkserve): the client of request rid is gone. A waiting request is dropped; the running one stops
         after its current cycle (its K/V stays as the cache of the next request)."""
         self.pending = [r for r in self.pending if r[0] != rid]
+        self.embeds.pop(rid, None)
         if self.active is not None and self.active["rid"] == rid:
             self.active = None
 
@@ -248,14 +270,27 @@ class Engine:
             if not self.pending:
                 return events
             rid, prompt, n, samp = self.pending.pop(0)
+            embeds = self.embeds.pop(rid, None)
             keep = self._begin(prompt, need_last=True)
             self.request_info[rid] = {"cached_tokens": keep}
-            first = self._prefill(prompt[keep:])
+            if embeds is not None:
+                # the cache can keep the context before the embeddings, never the embeddings themselves
+                if keep > embeds[0]:
+                    self._hard_reset(); keep = 0
+                    self.request_info[rid] = {"cached_tokens": 0}
+                first = self._prefill(prompt[keep:], (embeds[0] - keep, embeds[1]))
+            else:
+                first = self._prefill(prompt[keep:])
             if samp is not None:    # the first token, drawn from the logits of the last prompt row
                 first = mk_target.sample_rows(self.tg.row_logits(self._last_row), samp.sp, samp.seed,
                                               mx.array([len(prompt)], dtype=mx.int32), samp.filt)[0]
             spec = self.draft is not None and len(prompt) + n + 16 <= self.tg.T
-            act = self.active = {"rid": rid, "n": n, "sent": 0, "tok": first, "spec": spec, "hist": list(prompt), "samp": samp}
+            hist = list(prompt)
+            if embeds is not None:      # positions given as embeddings are unique: a later prompt never matches them
+                for j in range(embeds[0], embeds[0] + embeds[1].shape[0]):
+                    self._sentinel -= 1
+                    hist[j] = self._sentinel
+            act = self.active = {"rid": rid, "n": n, "sent": 0, "tok": first, "spec": spec, "hist": hist, "samp": samp}
             self.cached = act["hist"]           # the prompt and every committed token after it, as the request goes on
             if spec:
                 from mk_draft import Cal
