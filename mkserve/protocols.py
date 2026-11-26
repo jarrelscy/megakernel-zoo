@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 import uuid
 
 from aiohttp import web
@@ -94,10 +95,10 @@ def add_routes(app: web.Application, core) -> None:
             raise ValueError("the request body must be a JSON object")
         return body
 
-    async def collect(ids, n, sampling, stops, ignore_eos=False, parse=True):
+    async def collect(ids, n, sampling, stops, ignore_eos=False, parse=True, extra=None):
         """A whole answer: (content, reasoning, tool calls, final dict)."""
         content, reasoning, calls, final = "", "", [], None
-        async for step in core.run(ids, n, sampling, stops, ignore_eos, parse):
+        async for step in core.run(ids, n, sampling, stops, ignore_eos, parse, extra=extra):
             if step.get("done"):
                 final = step
             else:
@@ -209,6 +210,42 @@ def add_routes(app: web.Application, core) -> None:
             await resp.write(b"data: " + _dumps(dict(head, choices=[], usage=usage)).encode() + b"\n\n")
         await resp.write(b"data: [DONE]\n\n")
         return resp
+
+    async def inkling_transcribe(request):
+        """POST /v1/inkling/transcribe {"frames": base64 float16 [frame_count, encoder_dim], "frame_count": T,
+        "context": optional text placed before the instruction, "max_tokens": optional} -> {"text", "usage"}.
+        The speech encoder's frames go through the audio projector (MK_PROJECTOR) into the prompt
+        <context><instruction>\n<audio_prefix><audio><audio_suffix>, and the model writes the transcript, greedy."""
+        import json as _json
+        import math as _math
+        import os as _os
+        folder = _os.environ.get("MK_PROJECTOR", "")
+        if not folder:
+            return error("this server has no audio projector (MK_PROJECTOR)", status=404)
+        try:
+            cfg = _json.loads(Path(folder, "config.json").read_text())
+            body = await body_of(request)
+            frames, count = body.get("frames"), int(body.get("frame_count") or 0)
+            if not isinstance(frames, str) or count < 1:
+                return error("frames (base64 float16) and frame_count are required")
+            context = body.get("context") or ""
+            if not isinstance(context, str):
+                return error("context must be text")
+            enc = lambda t: core.tok.encode(t, add_special_tokens=False).ids  # noqa: E731
+            head = enc(context + cfg["instruction"] + "\n") + enc(cfg["audio_prefix"])
+            n_audio = _math.ceil(count / int(cfg["stack"]))
+            ids = head + [0] * n_audio + enc(cfg["audio_suffix"])
+            seconds = count / float(cfg.get("frames_per_second", 12.5))
+            n = int(body.get("max_tokens") or min(1500, int(seconds * float(cfg.get("tokens_per_second", 6))) + 40))
+        except (ValueError, KeyError, OSError) as exc:
+            return error(str(exc))
+        if (why := core.check(ids, n)):
+            return error(why)
+        t0 = time.time()
+        content, _r, _c, final = await collect(ids, n, None, [], False, parse=False,
+                                               extra={"audio": {"frames": frames, "count": count, "at": len(head)}})
+        return web.json_response({"text": content.strip(), "finish_reason": final["finish"], "seconds": round(time.time() - t0, 3),
+                                  "usage": openai_usage(final)}, dumps=_dumps)
 
     async def completions(request):
         try:
@@ -728,6 +765,7 @@ def add_routes(app: web.Application, core) -> None:
 
     app.add_routes([
         web.get("/health", health), web.get("/metrics", metrics), web.get("/api/status", api_status),
+        web.post("/v1/inkling/transcribe", inkling_transcribe),
         web.get("/v1/models", models), web.post("/v1/completions", completions), web.post("/v1/chat/completions", chat_completions),
         web.post("/v1/responses", responses),
         web.post("/v1/messages", anthropic), web.post("/v1/messages/count_tokens", anthropic_count),

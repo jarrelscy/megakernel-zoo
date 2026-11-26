@@ -255,6 +255,22 @@ class Engine:
             mx.eval(self._prefill(tokens[keep:]), *self._state())
         return keep
 
+    def project_audio(self, frames_b64: str, count: int):
+        """Speech encoder frames (base64 of float16 [count, encoder_dim]) -> input embeddings through the projector named
+        by MK_PROJECTOR (mk_audio.py), for submit(..., embeds=(start, rows))."""
+        if getattr(self, "_projector", None) is None:
+            folder = os.environ.get("MK_PROJECTOR", "")
+            if not folder:
+                raise ValueError("no audio projector: set MK_PROJECTOR to its folder")
+            from mk_audio import Projector
+            self._projector = Projector(folder)
+        import base64
+        frames = np.frombuffer(base64.b64decode(frames_b64), dtype="<f2").astype(np.float32)
+        dim = self._projector.dim
+        if count < 1 or frames.size != count * dim:
+            raise ValueError(f"audio: {frames.size} values are not {count} frames of {dim}")
+        return self._projector.rows(frames.reshape(count, dim))
+
     def cancel(self, rid) -> None:
         """Optional (mkserve): the client of request rid is gone. A waiting request is dropped; the running one stops
         after its current cycle (its K/V stays as the cache of the next request)."""

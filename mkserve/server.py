@@ -122,6 +122,15 @@ def engine_main(args) -> int:
                         engine.cancel(req["cancel"])
                     continue
                 samp = {k: req[k] for k in ("temperature", "top_p", "top_k", "seed") if k in req}
+                if "audio" in req:          # speech encoder frames for part of the prompt (POST /v1/inkling/transcribe)
+                    a = req["audio"]
+                    try:
+                        rows = engine.project_audio(a["frames"], int(a["count"]))
+                        engine.submit(req["rid"], req["ids"], req["n"], embeds=(int(a["at"]), rows))
+                    except Exception as exc:  # noqa: BLE001  a bad request must not stop the engine
+                        print(f"MKSERVE audio request {req['rid']} refused: {exc}", flush=True)
+                        send([[int(req["rid"]), [], True]])
+                    continue
                 if samp and getattr(engine, "native_sampling", False):  # the engine draws tokens inside its own path
                     engine.submit(req["rid"], req["ids"], req["n"], sampling=samp)
                 else:
@@ -432,7 +441,7 @@ class Core:
     def _decode(self, ids, parse):
         return self.tok.decode(ids, skip_special_tokens=not parse)
 
-    async def run(self, ids: list[int], n: int, sampling=None, stops=(), ignore_eos=False, parse=True):
+    async def run(self, ids: list[int], n: int, sampling=None, stops=(), ignore_eos=False, parse=True, extra=None):
         """Yields one dict per generated token: {"content": str, "reasoning": str, "tool_calls": [...]} (any may be
         empty: a client can time tokens by them), then {"done": True, "finish": "stop"|"length", "prompt_tokens",
         "completion_tokens", "stop_sequence"}. parse: read the answer's structure (response_template) instead of
@@ -448,6 +457,8 @@ class Core:
         msg = {"rid": rid, "ids": ids, "n": n, "eos": sorted(stop_ids)}
         if sampling:
             msg.update(sampling)
+        if extra:
+            msg.update(extra)
         self.writer.write((json.dumps(msg, separators=(",", ":")) + "\n").encode())
         st = self.stats
         t_start, t_first = time.perf_counter(), None
