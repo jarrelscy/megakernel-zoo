@@ -182,15 +182,34 @@ class Target:
         self.local = set(tc["local_layer_ids"])
         lc = tc["loop_config"]
         self.core = range(lc["core_start"], lc["core_end"])
-        self.passes = lc["num_passes"]
+        # MK_PASSES: run a variable-loop checkpoint at another number of loop passes than its config's (3 instead of 5
+        # is about 1.5x faster to read and write, from the same weights)
+        trained = lc["num_passes"]
+        self.passes = int(os.environ.get("MK_PASSES") or trained)
+        if self.passes != trained:
+            lc = tc["loop_config"] = dict(lc, num_passes=self.passes)
         # the layer visits whose input the draft head reads, and the final norm (the last id: the number of visits).
         # [5, 23, 41, 48] for 3 passes; a varloop checkpoint run at 5 passes gives [5, 23, 65, 72] in its config.
         ids = cfg.get("mtp_config", {}).get("target_layer_ids", [5, 23, 41, 48])
+        if self.passes != trained:
+            # a visit before the loop stays; one in a loop pass keeps its place counted from the last pass (pass 5 of 5
+            # becomes pass 3 of 3, pass 2 of 5 stays pass 2 when there are enough); one after the loop moves with it
+            cs, n = lc["core_start"], lc["core_end"] - lc["core_start"]
+            def moved(t):
+                if t < cs:
+                    return t
+                if t >= cs + trained * n:
+                    return t - (trained - self.passes) * n
+                k, off = divmod(t - cs, n)
+                return cs + max(0, k - (trained - self.passes)) * n + off if k >= self.passes else t
+            ids = [moved(t) for t in ids]
+        self.mtp_ids = list(ids)       # what the checkpoint's draft head reads at this number of passes
         self.taps = tuple(ids[:-1])
         # MK_DRAFT2: the 2DSD drafter (mk_draft2.py) reads the inputs of five weight layers in the last loop instead
         # (default for a variable-loop checkpoint when the drafter is on this Mac; MK_DRAFT2=0 keeps the checkpoint's head)
         d2_default = str(Path.home() / "Models/Inkling/2dsd-varloop-dspark")
-        self.draft2 = os.environ.get("MK_DRAFT2", d2_default if tc["loop_config"].get("is_varloop") else "")
+        # (the drafter was trained on the checkpoint's own number of passes: at another one the checkpoint's head drafts)
+        self.draft2 = os.environ.get("MK_DRAFT2", d2_default if tc["loop_config"].get("is_varloop") and self.passes == trained else "")
         if self.draft2 == "0" or not (Path(self.draft2) / "config.json").exists():
             self.draft2 = ""
         if self.draft2:

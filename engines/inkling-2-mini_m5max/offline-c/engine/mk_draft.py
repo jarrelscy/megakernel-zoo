@@ -97,7 +97,7 @@ class Draft:
         cfg = json.loads((Path(model_dir) / "config.json").read_text())
         mc = cfg["mtp_config"]
         assert mc["markov_head_type"] == "rnn_hidden" and mc["block_size"] == NB and mc["num_hidden_layers"] == 3
-        assert mc["hidden_size"] == 2304 and mc["markov_rank"] == 256 and list(mc["target_layer_ids"]) == list(tg.taps) + [tg.napp]
+        assert mc["hidden_size"] == 2304 and mc["markov_rank"] == 256 and getattr(tg, "mtp_ids", list(mc["target_layer_ids"])) == list(tg.taps) + [tg.napp]
         assert mc["num_attention_heads"] == 24 and mc["num_key_value_heads"] == 8 and mc["head_dim"] == 128
         self.tg = tg
         # The draft's own K/V. Up to DRAFT_CTX positions it is by position, as the target's. For a longer context it is a
