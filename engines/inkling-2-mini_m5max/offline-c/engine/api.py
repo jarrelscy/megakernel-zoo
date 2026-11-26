@@ -56,6 +56,8 @@ class Engine:
         self._stale = False         # reset() was called: the state is kept until the next sequence shows its first tokens
         self.request_info = {}      # rid -> {"cached_tokens": prompt tokens kept from the cache} (mkserve reads and removes it)
         self.embeds = {}            # rid -> (start, rows): input embeddings for part of a waiting request's prompt
+        from mk_kvstore import KVStore
+        self.kv = KVStore(f"{Path(model_dir).name}-{self.tg.passes}p")   # parked sequences (memory, then the SSD)
         self._sentinel = 0          # stand-ins for embedding positions in the cached token list: never match a prompt
         self.load_seconds = time.time() - t0
         self._warm()
@@ -123,6 +125,39 @@ class Engine:
         self.counters["prefix_hits"] += 1
         self.counters["prefix_tokens"] += keep
         return keep
+
+    def _switch(self, prompt) -> None:
+        """Before a request starts: if a parked sequence shares more of its prompt than the live one does, park the live
+        one and bring that one back; if the request would overwrite much of the live one, park it first."""
+        from mk_kvstore import lcp
+        kv, tg = self.kv, self.tg
+        if self.cached is not None and tg.pos > 0 and tg.pending is None:
+            # a snapshot where the last request stopped: its continuation (the next turn of a conversation, an answer
+            # after a reasoning budget) resumes exactly there instead of at the last 256-position snapshot
+            tg.flush()
+            tg.snaps[tg.pos] = list(tg.cw)
+        if not kv.enabled or self.cached is None:
+            return
+        limit = len(prompt) - 1
+        live = lcp(self.cached, prompt, min(tg.pos, limit)) if tg.snaps else 0
+        i, shared = kv.best(prompt, limit)
+        # positions of the live sequence this request would overwrite: a report check that shares only the system prompt
+        # with an agent conversation would otherwise wipe the conversation's cache, and its next turn reads it all again
+        discard = tg.pos - live
+        # bring a parked sequence back when it saves real work: most of it is reused (a short transcription context), or it
+        # saves a lot (an agent conversation); restoring a 35K-position entry to reuse 262 positions costs more than it saves
+        gain = shared - live
+        if i is not None and gain > 128 and (shared * 2 >= kv.entries[i]["pos"] or gain > 2048):
+            entry = kv.entries[i]
+            kv.park(tg, self.draft, self.cached)
+            self.cached = kv.restore(entry, tg, self.draft)
+            self._stale = True
+            if os.environ.get("MK_KV_LOG"):
+                print(f"MK_KV restored {entry['pos']} positions ({shared} shared; live shared {live}) {kv.summary()}", flush=True)
+        elif discard > 1024 or live < 256:     # or nothing of it would be kept (a short transcription context)
+            kv.park(tg, self.draft, self.cached)
+            if os.environ.get("MK_KV_LOG"):
+                print(f"MK_KV parked the live sequence ({discard} positions past the shared {live}) {kv.summary()}", flush=True)
 
     def step(self, tokens) -> mx.array:
         tokens = np.ascontiguousarray(np.asarray(tokens, dtype=np.int64))
@@ -203,6 +238,8 @@ class Engine:
         i, last = 0, None
         while mk_target.PREFILL != "off" and (len(prompt) - i > 8 or (embeds is not None and i < len(prompt))):
             n = min(PF_CHUNK, len(prompt) - i)
+            if embeds is not None and i < embeds[0] < i + n:
+                n = embeds[0] - i           # a pass ends where the embeddings start: a snapshot there (below)
             K = next(k for k in PF_BUCKETS if k >= n)
             if tg.pos + K > tg.T + 8:          # at the end of the context: no padding past it
                 if n < PF_BUCKETS[0]:
@@ -225,6 +262,9 @@ class Engine:
                 self.draft.append(f, p, n)
             mx.async_eval(last, *self._state())
             i += n
+            if embeds is not None and i == embeds[0]:
+                # where the embeddings start: the next request with the same text before its audio resumes here
+                tg.snaps[tg.pos] = list(tg.cw)
         while i < len(prompt):
             K = min(8, len(prompt) - i)
             toks = mx.array(np.asarray(prompt[i:i + K], dtype=np.int32))
@@ -287,6 +327,7 @@ class Engine:
                 return events
             rid, prompt, n, samp = self.pending.pop(0)
             embeds = self.embeds.pop(rid, None)
+            self._switch(prompt)
             keep = self._begin(prompt, need_last=True)
             self.request_info[rid] = {"cached_tokens": keep}
             if embeds is not None:
@@ -297,6 +338,8 @@ class Engine:
                 first = self._prefill(prompt[keep:], (embeds[0] - keep, embeds[1]))
             else:
                 first = self._prefill(prompt[keep:])
+            # a snapshot at the end of the prompt: a later request that shares the prompt but not the answer resumes here
+            self.tg.snaps[self.tg.pos] = list(self.tg.cw)
             if samp is not None:    # the first token, drawn from the logits of the last prompt row
                 first = mk_target.sample_rows(self.tg.row_logits(self._last_row), samp.sp, samp.seed,
                                               mx.array([len(prompt)], dtype=mx.int32), samp.filt)[0]

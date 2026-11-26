@@ -357,6 +357,10 @@ class Core:
         self.hello, self.writer, self.rt = hello, writer, rt
         self.native = hello["mode"] == "native"
         self.name = args.name
+        # an empty reasoning block, for thinking_budget 0: Inkling 2's own markers, when the tokenizer has them
+        marks = "<|message_model|><|content_thinking|><|end_message|>"
+        ids = tok.encode(marks, add_special_tokens=False).ids
+        self.empty_thinking = ids if len(ids) == 3 else None   # [open model message, thinking, end message]
         self.queues: dict[int, asyncio.Queue] = {}
         self.extra = {}  # rid -> facts the engine reported about the request (cached_tokens)
         self.counter = itertools.count(1)
@@ -441,7 +445,7 @@ class Core:
     def _decode(self, ids, parse):
         return self.tok.decode(ids, skip_special_tokens=not parse)
 
-    async def run(self, ids: list[int], n: int, sampling=None, stops=(), ignore_eos=False, parse=True, extra=None):
+    async def run(self, ids: list[int], n: int, sampling=None, stops=(), ignore_eos=False, parse=True, extra=None, stop_ids_extra=()):
         """Yields one dict per generated token: {"content": str, "reasoning": str, "tool_calls": [...]} (any may be
         empty: a client can time tokens by them), then {"done": True, "finish": "stop"|"length", "prompt_tokens",
         "completion_tokens", "stop_sequence"}. parse: read the answer's structure (response_template) instead of
@@ -449,7 +453,7 @@ class Core:
         could still turn into one is held back."""
         stops = [s for s in stops if s]
         hold = max((len(s) for s in stops), default=1) - 1
-        stop_ids = set() if ignore_eos else set(self.eos)
+        stop_ids = (set() if ignore_eos else set(self.eos)) | set(stop_ids_extra)
         parser = ResponseParser(self.rt) if parse and self.rt else None
         rid = next(self.counter)
         q: asyncio.Queue = asyncio.Queue()
@@ -462,11 +466,13 @@ class Core:
         self.writer.write((json.dumps(msg, separators=(",", ":")) + "\n").encode())
         st = self.stats
         t_start, t_first = time.perf_counter(), None
+        t_queued = None
         st["requests_total"] += 1; st["requests_running"] += 1; st["prompt_tokens_total"] += len(ids)
         live = self.live[rid] = {"start": t_start, "first": None, "prompt": len(ids), "out": 0, "marks": []}
         out: list[int] = []
         prefix = read = 0  # incremental detokenization: text is released when it is whole
         content, sent, finish, stop_seq, done = "", 0, None, None, False
+        stop_token = None
 
         def take(pieces, step) -> bool:
             """Sorts parsed pieces into the step; True when a stop string ended the answer."""
@@ -505,6 +511,7 @@ class Core:
                 for token in tokens:
                     if token in stop_ids:
                         finish, ended = "stop", True
+                        stop_token = token
                         break
                     out.append(token)
                     step = {"content": "", "reasoning": "", "tool_calls": []}
@@ -536,7 +543,7 @@ class Core:
                 yield tail
             cached = int(self.extra.get(rid, {}).get("cached_tokens", 0))
             st["cached_prompt_tokens_total"] += cached
-            yield {"done": True, "finish": finish, "stop_sequence": stop_seq, "prompt_tokens": len(ids), "completion_tokens": len(out),
+            yield {"done": True, "finish": finish, "stop_sequence": stop_seq, "prompt_tokens": len(ids), "completion_tokens": len(out), "ids": list(out), "stop_token": stop_token,
                    "cached_tokens": cached}
         except BaseException:
             st["requests_failed_total"] += 1
@@ -560,6 +567,14 @@ class Core:
                                      "prefill_seconds": round(pf, 3), "prefill_tps": round(prefilled / pf, 1) if pf > 0 else None,
                                      "completion_tokens": len(out),
                                      "decode_tps": round((len(out) - 1) / dec, 1) if dec > 0 and len(out) > 1 else None}
+                # MKSERVE_REQUEST_LOG: one JSON line per request (numbers only, never text): for latency work
+                if os.environ.get("MKSERVE_REQUEST_LOG"):
+                    try:
+                        with open(os.environ["MKSERVE_REQUEST_LOG"], "a") as fh:
+                            fh.write(json.dumps(dict(self.last_request, queued_seconds=round(t_start - t_queued, 3)
+                                                     if t_queued else None, audio="audio" in (extra or {}))) + "\n")
+                    except OSError:
+                        pass
             if not done:  # ended early: a step-mode batch drops the row; a native engine cancels it if it can
                 self.writer.write((json.dumps({"cancel": rid}) + "\n").encode())
 

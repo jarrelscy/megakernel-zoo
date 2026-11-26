@@ -95,10 +95,10 @@ def add_routes(app: web.Application, core) -> None:
             raise ValueError("the request body must be a JSON object")
         return body
 
-    async def collect(ids, n, sampling, stops, ignore_eos=False, parse=True, extra=None):
+    async def collect(ids, n, sampling, stops, ignore_eos=False, parse=True, extra=None, stop_ids_extra=()):
         """A whole answer: (content, reasoning, tool calls, final dict)."""
         content, reasoning, calls, final = "", "", [], None
-        async for step in core.run(ids, n, sampling, stops, ignore_eos, parse, extra=extra):
+        async for step in core.run(ids, n, sampling, stops, ignore_eos, parse, extra=extra, stop_ids_extra=stop_ids_extra):
             if step.get("done"):
                 final = step
             else:
@@ -175,7 +175,7 @@ def add_routes(app: web.Application, core) -> None:
         stops = body.get("stop") or []
         return n, sampling, [stops] if isinstance(stops, str) else list(stops)
 
-    async def openai_stream(request, ids, n, sampling, stops, body, chat: bool):
+    async def openai_stream(request, ids, n, sampling, stops, body, chat: bool, close_thinking: bool = False):
         rid, created = _id("chatcmpl-" if chat else "cmpl-"), int(time.time())
         head = {"id": rid, "object": "chat.completion.chunk" if chat else "text_completion", "created": created, "model": core.name}
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
@@ -185,23 +185,32 @@ def add_routes(app: web.Application, core) -> None:
             await resp.write(b"data: " + _dumps(dict(head, choices=[choice])).encode() + b"\n\n")
 
         first, n_calls, final = True, 0, None
-        async for step in core.run(ids, n, sampling, stops, bool(body.get("ignore_eos")), parse=chat):
-            if step.get("done"):
-                final = step
+        # close_thinking (a spent reasoning budget): a reasoning block the model opens is closed at once and the answer
+        # continues from the cache, as in the non-streamed path
+        think, end = (core.empty_thinking[1], core.empty_thinking[2]) if close_thinking and core.empty_thinking else (None, None)
+        for _segment in range(4 if think is not None else 1):
+            async for step in core.run(ids, n, sampling, stops, bool(body.get("ignore_eos")), parse=chat,
+                                       stop_ids_extra=(think,) if think is not None else ()):
+                if step.get("done"):
+                    final = step if final is None else dict(step, completion_tokens=final["completion_tokens"] + step["completion_tokens"])
+                    break
+                if not chat:  # one chunk per token (its text may be empty), so that a client can time tokens
+                    await send({"index": 0, "text": step["content"], "logprobs": None, "finish_reason": None})
+                    continue
+                delta = {"role": "assistant"} if first else {}
+                if step["reasoning"]:
+                    delta["reasoning_content"] = step["reasoning"]
+                if step["content"] or first:
+                    delta["content"] = step["content"]
+                if step["tool_calls"]:
+                    delta["tool_calls"] = [openai_call(c, n_calls + i) for i, c in enumerate(step["tool_calls"])]
+                    n_calls += len(step["tool_calls"])
+                first = False
+                await send({"index": 0, "delta": delta, "logprobs": None, "finish_reason": None})
+            if think is None or final.get("stop_token") != think:
                 break
-            if not chat:  # one chunk per token (its text may be empty), so that a client can time tokens
-                await send({"index": 0, "text": step["content"], "logprobs": None, "finish_reason": None})
-                continue
-            delta = {"role": "assistant"} if first else {}
-            if step["reasoning"]:
-                delta["reasoning_content"] = step["reasoning"]
-            if step["content"] or first:
-                delta["content"] = step["content"]
-            if step["tool_calls"]:
-                delta["tool_calls"] = [openai_call(c, n_calls + i) for i, c in enumerate(step["tool_calls"])]
-                n_calls += len(step["tool_calls"])
-            first = False
-            await send({"index": 0, "delta": delta, "logprobs": None, "finish_reason": None})
+            ids = ids + final["ids"] + [think, end]
+            n = max(1, n - len(final["ids"]))
         finish = "tool_calls" if n_calls and final["finish"] == "stop" else final["finish"]
         await send({"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish} if chat else
                    {"index": 0, "text": "", "logprobs": None, "finish_reason": finish})
@@ -280,18 +289,50 @@ def add_routes(app: web.Application, core) -> None:
                 return error("messages must be a non-empty list")
             tools = None if body.get("tool_choice") == "none" else _tools_openai(body.get("tools"))
             kwargs = dict(body.get("chat_template_kwargs") or {})
+            budget = body.get("thinking_budget", kwargs.pop("thinking_budget", None))
             effort = body.get("reasoning_effort", kwargs.pop("reasoning_effort", None))
             if effort is None and kwargs.get("enable_thinking") is False:
                 effort = False  # Qwen's switch, as clients send it: for a template that takes reasoning_effort (Inkling 2), effort "none"
             ids = core.render(openai_messages(messages), tools, reasoning_effort=_effort(effort), **kwargs)
+            # thinking_budget 0 (mkserve's own field, also in chat_template_kwargs): the answer starts after an empty reasoning
+            # block, so the model writes its tool calls or text at once. For simple turns such as filing a dictated phrase.
+            budget = int(budget) if budget is not None else None
+            if budget == 0 and core.empty_thinking:
+                ids = ids + core.empty_thinking
             n, sampling, stops = common(body)
         except ValueError as exc:
             return error(str(exc))
         if (why := core.check(ids, n)):
             return error(why)
+        thought = ""
+        if budget and budget > 0 and core.empty_thinking:
+            # A reasoning budget: the model reasons for at most `budget` tokens, the reasoning is closed there, and the
+            # answer continues from the prefix cache (the engine holds the prompt and the reasoning already).
+            opener, end = core.empty_thinking[:2], core.empty_thinking[2]
+            _c, _r, _k, part = await collect(ids + opener, budget, sampling, [], True, parse=False, stop_ids_extra=(end,))
+            reasoning_ids = [t for t in part["ids"] if t != end]
+            thought = core.tok.decode(reasoning_ids, skip_special_tokens=True).strip()
+            ids = ids + opener + reasoning_ids + [end]
+            n = max(1, n - len(reasoning_ids))
         if body.get("stream"):
-            return await openai_stream(request, ids, n, sampling, stops, body, chat=True)
-        content, reasoning, calls, final = await collect(ids, n, sampling, stops, bool(body.get("ignore_eos")))
+            return await openai_stream(request, ids, n, sampling, stops, body, chat=True,
+                                       close_thinking=budget is not None and budget >= 0)
+        if budget is not None and budget >= 0 and core.empty_thinking:
+            # The budget is spent: a reasoning block the model opens now is closed at once (it stops on the reasoning
+            # token; the block is ended empty and the answer continues from the cache), at most a few times.
+            think, end = core.empty_thinking[1], core.empty_thinking[2]
+            content, reasoning, calls, final = "", "", [], None
+            for _ in range(4):
+                c, r, k, part = await collect(ids, n, sampling, stops, bool(body.get("ignore_eos")), stop_ids_extra=(think,))
+                content += c; reasoning += r; calls += k
+                final = part if final is None else dict(part, completion_tokens=final["completion_tokens"] + part["completion_tokens"])
+                if part.get("stop_token") != think:
+                    break
+                ids = ids + part["ids"] + [think, end]
+                n = max(1, n - part["completion_tokens"])
+        else:
+            content, reasoning, calls, final = await collect(ids, n, sampling, stops, bool(body.get("ignore_eos")))
+        reasoning = (thought + ("\n" + reasoning if reasoning else "")) if thought else reasoning
         message = {"role": "assistant", "content": content or (None if calls else "")}
         if reasoning:
             message["reasoning_content"] = reasoning
