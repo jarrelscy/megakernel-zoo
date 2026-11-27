@@ -431,6 +431,8 @@ def attention_gate(q, kc, vc, krec, vrec, knew, vnew, rel, proj, sinks, meta, ap
     (the target keeps the big tier as one array per application, [1, T, 1024], and the recent tier as one array). A context beyond ATT_SMAX keys: a local layer needs scores for
     its window only; a global one keeps them in a device buffer (the same statements otherwise: the same bits)."""
     K = q.shape[0]
+    if ATT_SHARED and (not local or ATT_SHARED_LOCAL):
+        return attention_shared(q, kc, vc, krec, vrec, knew, vnew, rel, proj, sinks, meta, app, gate, smax, local)
     rtg = ATT_RTG if K < ATT_WIDE else 256
     projt = proj.shape[0] == 1024           # [1024, 16] (transposed at load) or the stored [16, 1024]
     if smax > ATT_SMAX and local:
@@ -455,6 +457,184 @@ _attg_big = mx.fast.metal_kernel(name="mk_attention_gate_big", input_names=["q",
                                  output_names=["out", "scr"], source=_ATT_BIG.replace("GATE_WRITE", """float4 gv = *((const device float4*)(gate + grp * 128 + d4));
         float4 sgm = 1.0f / (1.0f + metal::precise::exp(-gv));
         *((device half4*)(out + grp * 128 + d4)) = half4(o * sgm);"""))
+
+# ------------------------------------------------------------------------------------------------- shared attention
+# A global layer at a long context through the one-threadgroup-per-(row, head) kernel is 24 threadgroups per row each
+# walking every key, and each row and each of the 3 query heads of a KV head reads the keys again: ~360 us a visit at
+# 14K keys in a one-row pass, ~770 us at 4 rows.
+# Shared reads: one threadgroup per (KV head, chunk of ATT_CH keys at fixed positions) does every row of the pass and
+# the 3 query heads of the KV head, so each key and value is read once per pass (the split kernel above reads them once
+# per (row, head)). A row's sums cover the same keys in the same order at any K: the chunks are fixed positions, the
+# per-row statements those of a one-row pass.
+ATT_CH = int(_os3.environ.get("MK_ATT_CH", "256"))
+ATT_SHARED = _os3.environ.get("MK_ATT_SHARED", "1") == "1"
+ATT_SHARED_LOCAL = _os3.environ.get("MK_ATT_SHARED_LOCAL", "0") == "1"      # local windows: no gain (26 vs 27 us at one row), slower at 8 rows
+_ATT_SH1 = """
+#define hf4_(e) float4(*((const device half4*)(e)))
+    constexpr int TG = 256;
+    constexpr int RB = 4;                    // rows per round: 3 * RB score rows in threadgroup memory
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint grp = threadgroup_position_in_grid.x;
+    int p0 = meta[0];
+    int base = meta[2];
+    int win = meta[1];
+    int first0 = win > 0 ? max(0, p0 - win + 1) : 0;    // the first row's first key; later rows start later
+    int cbase = first0 / CH;                            // partials are kept from this chunk on
+    int chunk = cbase + int(grp / 8), kvh = grp % 8;
+    int lo = chunk * CH;
+    if (lo > p0 + KR - 1) return;
+    threadgroup float sc[3 * RB][CH];
+    threadgroup float tq[3 * RB][128];
+    threadgroup float red[8][3 * RB];
+    threadgroup float4 part[TG];
+    int c = tid / 32;
+    int d4 = (tid % 32) * 4;
+    for (int rb = 0; rb < KR; rb += RB) {
+        int nr = min(RB, KR - rb);
+        if (p0 + rb + nr - 1 < lo) break;               // rows in order: the later rounds' rows are later still
+        int hiall = min(lo + CH - 1, p0 + rb + nr - 1);
+        if (win > 0 && lo + CH - 1 < p0 + rb - win + 1) continue;     // the chunk is before every window of the round
+        for (int i = tid; i < 3 * nr * 128; i += TG) {
+            int rr = i / 384, hh = (i / 128) % 3, dd = i % 128;
+            tq[rr * 3 + hh][dd] = q[((rb + rr) * 24 + kvh * 3 + hh) * 128 + dd];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float lmax[3 * RB];
+        for (int j = 0; j < 3 * RB; j++) lmax[j] = -INFINITY;
+        for (int s = lo + int(tid); s <= hiall; s += TG) {
+            const device ushort* kp = (s < base ? kc + (size_t(app[0]) * TT + s) * 1024 : (s < p0 ? krec + (size_t(app[1]) * RR + (s - base)) * 1024 : knew + (s - p0) * 1024)) + kvh * 128;
+            float4 a[3 * RB];
+            for (int j = 0; j < 3 * RB; j++) a[j] = float4(0.0f);
+            for (int j = 0; j < 32; j += 4) {                 // loads first, each sum in dim order
+                float4 k0 = hf4_(kp + 4 * j), k1 = hf4_(kp + 4 * j + 4), k2 = hf4_(kp + 4 * j + 8), k3 = hf4_(kp + 4 * j + 12);
+                for (int t = 0; t < 3 * nr; t++) {
+                    threadgroup const float* qp = tq[t];
+                    float4 q0 = *((threadgroup const float4*)(qp + 4 * j)), q1 = *((threadgroup const float4*)(qp + 4 * j + 4));
+                    float4 q2 = *((threadgroup const float4*)(qp + 4 * j + 8)), q3 = *((threadgroup const float4*)(qp + 4 * j + 12));
+                    a[t] = fma(k0, q0, a[t]); a[t] = fma(k1, q1, a[t]); a[t] = fma(k2, q2, a[t]); a[t] = fma(k3, q3, a[t]);
+                }
+            }
+            for (int t = 0; t < 3 * nr; t++) {
+                int pos = p0 + rb + t / 3;
+                if (s > pos || (win > 0 && s < pos - win + 1)) continue;
+                int d = pos - s;
+                int pr_ = (rb + t / 3) * 24 + kvh * 3 + t % 3;
+                float v = ((a[t].x + a[t].y) + (a[t].z + a[t].w)) * 0.08838834764831845f;
+                if (d < 1024) {
+                    const device float* rp = rel + pr_ * 16;
+                    float b = 0.0f;
+                    for (int r = 0; r < 16; r += 4) {
+                        float4 r4 = *((const device packed_float4*)(rp + r));
+                        float pa, pb, pc, pd;
+                        if (PROJT) {
+                            float4 p4 = *((const device float4*)(proj + d * 16 + r));
+                            pa = p4.x; pb = p4.y; pc = p4.z; pd = p4.w;
+                        } else {
+                            pa = proj[r * 1024 + d]; pb = proj[(r + 1) * 1024 + d]; pc = proj[(r + 2) * 1024 + d]; pd = proj[(r + 3) * 1024 + d];
+                        }
+                        b = fma(r4.x, pa, b); b = fma(r4.y, pb, b); b = fma(r4.z, pc, b); b = fma(r4.w, pd, b);
+                    }
+                    v += b;
+                }
+                sc[t][s - lo] = v;
+                lmax[t] = max(lmax[t], v);
+            }
+        }
+        for (int j = 0; j < 3 * nr; j++) {
+            float m = simd_max(lmax[j]);
+            if (lane == 0) red[sg][j] = m;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float mx_[3 * RB];
+        for (int j = 0; j < 3 * nr; j++) {
+            float m = red[0][j];
+            for (int i = 1; i < 8; i++) m = max(m, red[i][j]);
+            mx_[j] = m;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float ls[3 * RB];
+        for (int j = 0; j < 3 * nr; j++) {
+            int hi = min(lo + CH - 1, p0 + rb + j / 3);
+            int fj = win > 0 ? max(0, p0 + rb + j / 3 - win + 1) : 0;
+            float lsum = 0.0f;
+            for (int s = lo + int(tid); s <= hi; s += TG) {
+                if (s < fj) continue;
+                float pr = metal::precise::exp(sc[j][s - lo] - mx_[j]);
+                sc[j][s - lo] = pr;
+                lsum += pr;
+            }
+            ls[j] = simd_sum(lsum);
+        }
+        for (int j = 0; j < 3 * nr; j++) if (lane == 0) red[sg][j] = ls[j];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float4 acc[3 * RB];
+        for (int j = 0; j < 3 * RB; j++) acc[j] = float4(0.0f);
+        for (int s = lo + c; s <= hiall; s += 8) {
+            float4 vf = float4(*((const device half4*)((s < base ? vc + (size_t(app[0]) * TT + s) * 1024 : (s < p0 ? vrec + (size_t(app[1]) * RR + (s - base)) * 1024 : vnew + (s - p0) * 1024)) + kvh * 128 + d4)));
+            for (int j = 0; j < 3 * nr; j++)
+                if (s <= p0 + rb + j / 3 && (win == 0 || s >= p0 + rb + j / 3 - win + 1)) acc[j] = fma(vf, float4(sc[j][s - lo]), acc[j]);
+        }
+        for (int j = 0; j < 3 * nr; j++) {
+            float tot = 0.0f;
+            for (int i = 0; i < 8; i++) tot += red[i][j];
+            part[tid] = acc[j];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid < 32) {
+                int pr_ = (rb + j / 3) * 24 + kvh * 3 + j % 3;
+                float4 o = part[tid];
+                for (int i = 1; i < 8; i++) o += part[i * 32 + tid];
+                size_t at = size_t(pr_) * NCH + (chunk - cbase);
+                *((device float4*)(pacc + at * 128 + d4)) = o;
+                if (tid == 0) { pm[at] = mx_[j]; pl[at] = tot; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+"""
+_att_sh1 = mx.fast.metal_kernel(name="mk_attention_shared1", input_names=["q", "kc", "vc", "krec", "vrec", "knew", "vnew", "rel", "proj", "meta", "app"],
+                                output_names=["pm", "pl", "pacc"], source=_ATT_SH1)
+_ATT_SH2 = """
+    uint grp = threadgroup_position_in_grid.x;
+    uint d4 = thread_position_in_threadgroup.x * 4;
+    int pos = meta[0] + int(grp) / 24;
+    int win = meta[1];
+    int cbase = (win > 0 ? max(0, meta[0] - win + 1) : 0) / CH;
+    int c0 = (win > 0 ? max(0, pos - win + 1) : 0) / CH - cbase;
+    int last = pos / CH - cbase;
+    float sink = sinks[grp];
+    float M = sink;
+    for (int c = c0; c <= last; c++) M = max(M, pm[grp * NCH + c]);
+    float tot = metal::precise::exp(sink - M);
+    float4 o = float4(0.0f);
+    for (int c = c0; c <= last; c++) {
+        float w = metal::precise::exp(pm[grp * NCH + c] - M);
+        tot += pl[grp * NCH + c] * w;
+        o = fma(*((const device float4*)(pacc + (size_t(grp) * NCH + c) * 128 + d4)), float4(w), o);
+    }
+    o = o / tot;
+    float4 gv = *((const device float4*)(gate + grp * 128 + d4));
+    float4 sgm = 1.0f / (1.0f + metal::precise::exp(-gv));
+    *((device half4*)(out + grp * 128 + d4)) = half4(o * sgm);
+"""
+_att_sh2 = mx.fast.metal_kernel(name="mk_attention_shared2", input_names=["pm", "pl", "pacc", "sinks", "gate", "meta"],
+                                output_names=["out"], source=_ATT_SH2)
+
+
+def attention_shared(q, kc, vc, krec, vrec, knew, vnew, rel, proj, sinks, meta, app, gate, smax: int, local: bool = False) -> mx.array:
+    """attention_gate() of a global layer, keys in chunks of ATT_CH at fixed positions, each read once per pass."""
+    K = q.shape[0]
+    nch = (1024 + K + 2 * ATT_CH - 2) // ATT_CH if local else (smax + ATT_CH - 1) // ATT_CH
+    projt = proj.shape[0] == 1024
+    pm, pl, pacc = _att_sh1(inputs=[q, kc, vc, krec, vrec, knew, vnew, rel, proj, meta, app],
+                            template=[("CH", ATT_CH), ("NCH", nch), ("KR", K), ("TT", kc.shape[1]), ("RR", krec.shape[1]), ("PROJT", projt)],
+                            grid=(nch * 8 * 256, 1, 1), threadgroup=(256, 1, 1),
+                            output_shapes=[(K * 24 * nch,), (K * 24 * nch,), (K * 24 * nch, 128)],
+                            output_dtypes=[mx.float32, mx.float32, mx.float32])
+    return _att_sh2(inputs=[pm, pl, pacc, sinks, gate, meta], template=[("CH", ATT_CH), ("NCH", nch)], grid=(K * 24 * 32, 1, 1),
+                    threadgroup=(32, 1, 1), output_shapes=[(K, 3072)], output_dtypes=[mx.uint16])[0]
+
 
 import os as _os2
 # attention: real threads per (row, head) group in passes of < ATT_WIDE rows. The sums keep the 256-thread layout (same
