@@ -21,7 +21,12 @@ SPEC = os.environ.get("MK_SPEC", "1") != "0"
 # MLX GEMMs and fused attention, what mkserve serves); a pass is padded to the next of PF_BUCKETS rows, so only those
 # shapes are ever compiled (all of them in _warm)
 PF_CHUNK = int(os.environ.get("MK_PF_CHUNK", "256"))
-PF_BUCKETS = [k for k in (32, 64, 128, 256, 512) if k <= PF_CHUNK]
+# MK_PF_BUCKETS: the padded pass sizes. 32 rows measured slower than 64 at a 14K-position context (149 vs 102 ms), so
+# a short prompt tail pads to 64 by default
+PF_BUCKETS = [k for k in (int(v) for v in os.environ.get("MK_PF_BUCKETS", "64,128,256,512").split(",")) if k <= PF_CHUNK]
+# MK_PF_MIN: a remainder of at most this many tokens goes through the step's kernels (8 rows a pass) instead of a padded
+# wide pass (at a 14K-position context, 9-16 new tokens: 41-58 ms in steps, 78 ms in a 64-row pass)
+PF_MIN = int(os.environ.get("MK_PF_MIN", "16"))
 
 
 class Engine:
@@ -239,13 +244,13 @@ class Engine:
         self.pending.append((rid, prompt, n, self._sampling(sampling)))
 
     def _prefill(self, prompt, embeds=None):
-        """The prompt in wide passes of up to PF_CHUNK rows (the last few tokens, if fewer than 9 remain, in a pass of
+        """The prompt in wide passes of up to PF_CHUNK rows (the last few tokens, if at most PF_MIN remain, in passes of
         the step's kernels); returns the first new token (lazy). embeds = [(start, rows), ...] relative to this prompt,
         in order: every pass is then a wide one, so the rows go in where the token embeddings would."""
         tg = self.tg
         i, last = 0, None
         first_at = embeds[0][0] if embeds else None
-        while mk_target.PREFILL != "off" and (len(prompt) - i > 8 or (embeds and i < len(prompt))):
+        while mk_target.PREFILL != "off" and (len(prompt) - i > PF_MIN or (embeds and i < len(prompt))):
             n = min(PF_CHUNK, len(prompt) - i)
             if first_at is not None and i < first_at < i + n:
                 n = first_at - i            # a pass ends where the embeddings start: a snapshot there (below)
