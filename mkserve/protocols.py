@@ -82,22 +82,54 @@ def _image_bytes(part: dict) -> bytes:
         raise ValueError(f"image data is not base64: {exc}") from exc
 
 
+AUDIO_TYPES = ("input_audio_frames",)
+MEDIA_TOKEN = "<|unused_200054|>"
+
+
 def _content_with_images(content, images: list) -> object:
-    """The content for the chat template: the text, or, when it holds images (MK_VISION_URL set), the list of text and
-    image parts in order, each image's bytes appended to `images`."""
-    if not VISION_URL or not isinstance(content, list) or not any(
-            isinstance(p, dict) and p.get("type") in IMAGE_TYPES for p in content):
+    """The content for the chat template: the text, or, when it holds images (MK_VISION_URL set) or speech encoder
+    frames (an `input_audio_frames` part: {"frames": base64 float16 [frame_count, encoder_dim], "frame_count"}, with
+    MK_PROJECTOR set), the list of text and image parts in order. Each image or audio part is appended to `images` in
+    order. Audio goes inline in the text around it (a placeholder the prompt expands to the projected rows), as the
+    audio projector was trained: text, the audio, text."""
+    if not isinstance(content, list):
         return _text_of(content)
-    parts = []
+    has_image = VISION_URL and any(isinstance(p, dict) and p.get("type") in IMAGE_TYPES for p in content)
+    has_audio = any(isinstance(p, dict) and p.get("type") in AUDIO_TYPES for p in content)
+    if not has_image and not has_audio:
+        return _text_of(content)
+    parts: list = []
+
+    def add_text(text: str) -> None:
+        if parts and parts[-1].get("type") == "text":
+            parts[-1]["text"] += text
+        else:
+            parts.append({"type": "text", "text": text})
+
     for p in content:
         if isinstance(p, str):
-            parts.append({"type": "text", "text": p})
-        elif isinstance(p, dict) and p.get("type") in IMAGE_TYPES:
-            images.append(_image_bytes(p))
+            add_text(p)
+        elif isinstance(p, dict) and p.get("type") in IMAGE_TYPES and VISION_URL:
+            images.append({"image": _image_bytes(p)})
             parts.append({"type": "image"})
+        elif isinstance(p, dict) and p.get("type") in AUDIO_TYPES:
+            frames, count = p.get("frames"), int(p.get("frame_count") or 0)
+            if not isinstance(frames, str) or count < 1:
+                raise ValueError("an input_audio_frames part needs frames (base64 float16) and frame_count")
+            images.append({"audio": frames, "frame_count": count})
+            add_text(MEDIA_TOKEN)
         elif isinstance(p, dict) and p.get("type") in (None, "text", "input_text", "output_text"):
-            parts.append({"type": "text", "text": p.get("text") or ""})
+            add_text(p.get("text") or "")
     return parts
+
+
+def _audio_rows(frame_count: int) -> int:
+    """How many prompt positions the projector makes of frame_count encoder frames (its config's stack)."""
+    folder = os.environ.get("MK_PROJECTOR", "")
+    if not folder:
+        raise ValueError("audio in a chat turn needs the server's audio projector (MK_PROJECTOR)")
+    stack = int(json.loads(Path(folder, "config.json").read_text())["stack"])
+    return -(-frame_count // stack)
 
 
 _vision_cache: dict = {}
@@ -245,21 +277,31 @@ def add_routes(app: web.Application, core) -> None:
         return n, sampling, [stops] if isinstance(stops, str) else list(stops)
 
     async def expand_images(ids: list, images: list) -> tuple[list, dict]:
-        """Each image's one placeholder token in the rendered prompt, as many placeholders as the image has rows, and
-        the engine's embedding blocks for them (positions, rows, a key naming the content)."""
-        image_id = core.tok.token_to_id("<|unused_200054|>")
+        """Each image's or audio's one placeholder token in the rendered prompt, as many placeholders as it has rows,
+        and the engine's embedding blocks for them (positions, the rows or the encoder frames the engine projects, a
+        key naming the content so a later prompt with the same image or audio reuses the cache)."""
+        image_id = core.tok.token_to_id(MEDIA_TOKEN)
         at = [i for i, t in enumerate(ids) if t == image_id]
         if len(at) != len(images):
-            raise ValueError(f"the template placed {len(at)} image tokens for {len(images)} images")
-        found = await asyncio.gather(*[asyncio.to_thread(_vision_rows, data) for data in images])
+            raise ValueError(f"the template placed {len(at)} image or audio tokens for {len(images)} parts")
+        images_only = [m["image"] for m in images if "image" in m]
+        found = iter(await asyncio.gather(*[asyncio.to_thread(_vision_rows, data) for data in images_only]))
         out, blocks, prev = [], [], 0
-        for pos, rows in zip(at, found):
+        for pos, media in zip(at, images):
             out += ids[prev:pos]
-            blocks.append({"at": len(out), "rows": rows["rows"], "count": rows["count"], "key": rows["key"]})
-            out += [image_id] * rows["count"]
+            if "image" in media:
+                rows = next(found)
+                blocks.append({"at": len(out), "rows": rows["rows"], "count": rows["count"], "key": rows["key"]})
+                n = rows["count"]
+            else:
+                n = _audio_rows(media["frame_count"])
+                key = int(hashlib.sha256(media["audio"].encode()).hexdigest()[:12], 16)
+                blocks.append({"at": len(out), "frames": media["audio"], "frame_count": media["frame_count"],
+                               "count": n, "key": key})
+            out += [image_id] * n
             prev = pos + 1
         out += ids[prev:]
-        return out, {"images": blocks}
+        return out, {"media": blocks}
 
     async def openai_stream(request, ids, n, sampling, stops, body, chat: bool, close_thinking: bool = False, extra=None):
         rid, created = _id("chatcmpl-" if chat else "cmpl-"), int(time.time())
