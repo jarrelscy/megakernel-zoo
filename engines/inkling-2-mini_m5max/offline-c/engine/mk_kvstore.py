@@ -60,6 +60,8 @@ class KVStore:
     def best(self, prompt: list, limit: int):
         """The entry sharing the longest prefix with prompt: (index, shared tokens), or (None, 0)."""
         bi, bl = None, 0
+        # an entry whose file is gone (another server on the same folder dropped it) is forgotten, not restored
+        self.entries = [e for e in self.entries if "path" not in e or Path(e["path"]).exists()]
         for i, e in enumerate(self.entries):
             n = lcp(e["tokens"], prompt, limit)
             if n > bl:
