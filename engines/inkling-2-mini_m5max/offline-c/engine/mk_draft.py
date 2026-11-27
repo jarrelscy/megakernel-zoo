@@ -19,6 +19,8 @@ import mk_target as mt
 F32 = mx.float32
 NB = 8
 NARROW = os.environ.get("MK_NARROW", "1") == "1"
+# greedy drafts: the Markov steps score only the base logits' MTOP best tokens of a row (0: the whole vocabulary)
+MTOP = int(os.environ.get("MK_MTOP", "64"))      # 64: 1-3% faster decode, the more() steps 0.76 -> 0.19 ms
 
 
 def rms(x, w=None, eps=1e-6):
@@ -296,6 +298,12 @@ class Draft:
         state = mx.zeros((1, 256), dtype=F32)
         if samp is not None:        # (sp, seed, filt): the drafts are drawn with the target's noise of their positions
             samp = (samp[0], samp[1], cpos[:1].astype(mx.int32) + 1, samp[2])
+        elif MTOP and self.q8:
+            # greedy drafts: the Markov steps score the base logits' MTOP best tokens of each row only (their values and
+            # indices side by side in `base`, which the rest of the block carries to more())
+            import mk_draft2
+            cands, vals = mk_draft2.top_cands(base, MTOP)
+            base = mx.concatenate([vals, cands.astype(F32)], axis=-1)
         d, p, state, prev = self._markov(context[:self.n1], base[:self.n1], state, anchor, samp)
         return d, p, state, prev, context[self.n1:], base[self.n1:]
 
@@ -393,6 +401,17 @@ class Draft:
             gt = mx.sigmoid(raw[:, :256])
             state = gt * state + (1.0 - gt) * mx.tanh(raw[:, 256:512])
             latent = mx.tanh(raw[:, 512:])
+            if samp is None and MTOP and self.q8:
+                ci = base[i, MTOP:].astype(mx.int32)                                         # [MTOP] candidates
+                fq = self.fold_w[0][ci].astype(F32) * self.fold_w[1][ci][:, None]            # [MTOP, 256]
+                lat = latent.astype(mx.float16).astype(F32)                                  # the half bits gemv8 reads
+                z = base[i:i + 1, :MTOP] + (lat @ fq.T)
+                lg = self.cap * mx.tanh(z * (1.0 / self.cap))
+                j = mx.argmax(lg, axis=-1)
+                prev = ci[j].astype(mx.int32)
+                probs.append(mx.exp(lg.max(axis=-1) - mx.logsumexp(lg, axis=-1)))
+                drafts.append(prev)
+                continue
             z = base[i:i + 1] + (kn.gemv8_narrow(self.fold_w, kn.bits(latent)) if (self.q8 and NARROW) else (kn.gemv8 if self.q8 else kn.gemv)(self.fold_w, kn.bits(latent)))
             lg = self.cap * mx.tanh(z * (1.0 / self.cap))
             if samp is not None:
