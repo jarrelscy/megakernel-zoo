@@ -131,6 +131,19 @@ def engine_main(args) -> int:
                         print(f"MKSERVE audio request {req['rid']} refused: {exc}", flush=True)
                         send([[int(req["rid"]), [], True]])
                     continue
+                if "images" in req:         # vision features for image placeholders in the prompt (MK_VISION_URL)
+                    try:
+                        import base64 as _b64
+                        import numpy as _np
+                        blocks = []
+                        for im in req["images"]:
+                            rows = _np.frombuffer(_b64.b64decode(im["rows"]), dtype="<f2").astype(_np.float32)
+                            blocks.append((int(im["at"]), rows.reshape(int(im["count"]), -1), int(im["key"])))
+                        engine.submit(req["rid"], req["ids"], req["n"], embeds=blocks)
+                    except Exception as exc:  # noqa: BLE001  a bad request must not stop the engine
+                        print(f"MKSERVE image request {req['rid']} refused: {exc}", flush=True)
+                        send([[int(req["rid"]), [], True]])
+                    continue
                 if samp and getattr(engine, "native_sampling", False):  # the engine draws tokens inside its own path
                     engine.submit(req["rid"], req["ids"], req["n"], sampling=samp)
                 else:

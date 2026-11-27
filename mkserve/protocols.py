@@ -11,8 +11,13 @@ writes the model's answer (reasoning, text, tool calls: mkserve/output.py) in it
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import hashlib
 import json
+import os
 import time
+import urllib.request
 from pathlib import Path
 import uuid
 
@@ -51,8 +56,71 @@ def _text_of(content) -> str:
         elif isinstance(p, dict) and p.get("type") in (None, "text", "input_text", "output_text"):
             parts.append(p.get("text") or "")
         elif isinstance(p, dict) and p.get("type") in ("image", "image_url", "input_image"):
-            raise ValueError("images are not supported by this engine yet")
+            raise ValueError("images are not supported by this engine yet (start the server with MK_VISION_URL)")
     return "".join(parts)
+
+
+VISION_URL = os.environ.get("MK_VISION_URL", "").rstrip("/")
+IMAGE_TYPES = ("image", "image_url", "input_image")
+
+
+def _image_bytes(part: dict) -> bytes:
+    """The bytes of an image content part: an OpenAI image_url, a Responses input_image or an Anthropic image, given as
+    a data URL or base64. Never fetched from a URL: the server reads nothing the client did not send."""
+    src = part.get("image_url", part.get("source", part.get("image")))
+    if isinstance(src, dict):
+        src = src.get("url") or src.get("data")
+    if not isinstance(src, str) or not src:
+        raise ValueError("an image part needs its data (a data: URL or base64)")
+    if src.startswith("data:"):
+        src = src.split(",", 1)[1] if "," in src else ""
+    elif src.startswith(("http://", "https://")):
+        raise ValueError("image URLs are not fetched: send the image as a data: URL")
+    try:
+        return base64.b64decode(src, validate=False)
+    except ValueError as exc:
+        raise ValueError(f"image data is not base64: {exc}") from exc
+
+
+def _content_with_images(content, images: list) -> object:
+    """The content for the chat template: the text, or, when it holds images (MK_VISION_URL set), the list of text and
+    image parts in order, each image's bytes appended to `images`."""
+    if not VISION_URL or not isinstance(content, list) or not any(
+            isinstance(p, dict) and p.get("type") in IMAGE_TYPES for p in content):
+        return _text_of(content)
+    parts = []
+    for p in content:
+        if isinstance(p, str):
+            parts.append({"type": "text", "text": p})
+        elif isinstance(p, dict) and p.get("type") in IMAGE_TYPES:
+            images.append(_image_bytes(p))
+            parts.append({"type": "image"})
+        elif isinstance(p, dict) and p.get("type") in (None, "text", "input_text", "output_text"):
+            parts.append({"type": "text", "text": p.get("text") or ""})
+    return parts
+
+
+_vision_cache: dict = {}
+
+
+def _vision_rows(data: bytes) -> dict:
+    """An image's input rows from the vision service (MK_VISION_URL): {"rows": base64 float16, "count", "key"}, kept
+    by content so an image already in the conversation is not encoded again."""
+    digest = hashlib.sha256(data).hexdigest()
+    hit = _vision_cache.get(digest)
+    if hit is None:
+        req = urllib.request.Request(VISION_URL + "/embed", data=json.dumps({"image": base64.b64encode(data).decode()}).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                out = json.loads(r.read())
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"the vision service could not read the image: {exc}") from exc
+        hit = {"rows": out["rows"], "count": int(out["count"]), "key": int(digest[:12], 16)}
+        if len(_vision_cache) > 64:
+            _vision_cache.pop(next(iter(_vision_cache)))
+        _vision_cache[digest] = hit
+    return hit
 
 
 def _tools_openai(tools) -> list | None:
@@ -138,14 +206,15 @@ def add_routes(app: web.Application, core) -> None:
                 "total_tokens": final["prompt_tokens"] + final["completion_tokens"],
                 "prompt_tokens_details": {"cached_tokens": final.get("cached_tokens", 0)}}
 
-    def openai_messages(messages) -> list:
-        """OpenAI chat messages for the template: text parts joined, tool-call arguments as objects, reasoning kept."""
+    def openai_messages(messages, images: list | None = None) -> list:
+        """OpenAI chat messages for the template: text parts joined, tool-call arguments as objects, reasoning kept.
+        With `images` (a list) and MK_VISION_URL set, image parts are kept and their bytes appended to it, in order."""
         out = []
         for m in messages:
             if not isinstance(m, dict) or "role" not in m:
                 raise ValueError("every message needs a role")
             role = "system" if m["role"] == "developer" else m["role"]
-            msg = {"role": role, "content": _text_of(m.get("content"))}
+            msg = {"role": role, "content": _content_with_images(m.get("content"), images if images is not None else [])}
             for key in ("name", "tool_call_id"):
                 if m.get(key):
                     msg[key] = m[key]
@@ -175,7 +244,24 @@ def add_routes(app: web.Application, core) -> None:
         stops = body.get("stop") or []
         return n, sampling, [stops] if isinstance(stops, str) else list(stops)
 
-    async def openai_stream(request, ids, n, sampling, stops, body, chat: bool, close_thinking: bool = False):
+    async def expand_images(ids: list, images: list) -> tuple[list, dict]:
+        """Each image's one placeholder token in the rendered prompt, as many placeholders as the image has rows, and
+        the engine's embedding blocks for them (positions, rows, a key naming the content)."""
+        image_id = core.tok.token_to_id("<|unused_200054|>")
+        at = [i for i, t in enumerate(ids) if t == image_id]
+        if len(at) != len(images):
+            raise ValueError(f"the template placed {len(at)} image tokens for {len(images)} images")
+        found = await asyncio.gather(*[asyncio.to_thread(_vision_rows, data) for data in images])
+        out, blocks, prev = [], [], 0
+        for pos, rows in zip(at, found):
+            out += ids[prev:pos]
+            blocks.append({"at": len(out), "rows": rows["rows"], "count": rows["count"], "key": rows["key"]})
+            out += [image_id] * rows["count"]
+            prev = pos + 1
+        out += ids[prev:]
+        return out, {"images": blocks}
+
+    async def openai_stream(request, ids, n, sampling, stops, body, chat: bool, close_thinking: bool = False, extra=None):
         rid, created = _id("chatcmpl-" if chat else "cmpl-"), int(time.time())
         head = {"id": rid, "object": "chat.completion.chunk" if chat else "text_completion", "created": created, "model": core.name}
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
@@ -189,7 +275,7 @@ def add_routes(app: web.Application, core) -> None:
         # continues from the cache, as in the non-streamed path
         think, end = (core.empty_thinking[1], core.empty_thinking[2]) if close_thinking and core.empty_thinking else (None, None)
         for _segment in range(4 if think is not None else 1):
-            async for step in core.run(ids, n, sampling, stops, bool(body.get("ignore_eos")), parse=chat,
+            async for step in core.run(ids, n, sampling, stops, bool(body.get("ignore_eos")), parse=chat, extra=extra,
                                        stop_ids_extra=(think,) if think is not None else ()):
                 if step.get("done"):
                     final = step if final is None else dict(step, completion_tokens=final["completion_tokens"] + step["completion_tokens"])
@@ -293,7 +379,11 @@ def add_routes(app: web.Application, core) -> None:
             effort = body.get("reasoning_effort", kwargs.pop("reasoning_effort", None))
             if effort is None and kwargs.get("enable_thinking") is False:
                 effort = False  # Qwen's switch, as clients send it: for a template that takes reasoning_effort (Inkling 2), effort "none"
-            ids = core.render(openai_messages(messages), tools, reasoning_effort=_effort(effort), **kwargs)
+            images: list = []
+            ids = core.render(openai_messages(messages, images), tools, reasoning_effort=_effort(effort), **kwargs)
+            extra = None
+            if images:
+                ids, extra = await expand_images(ids, images)
             # thinking_budget 0 (mkserve's own field, also in chat_template_kwargs): the answer starts after an empty reasoning
             # block, so the model writes its tool calls or text at once. For simple turns such as filing a dictated phrase.
             budget = int(budget) if budget is not None else None
@@ -309,21 +399,23 @@ def add_routes(app: web.Application, core) -> None:
             # A reasoning budget: the model reasons for at most `budget` tokens, the reasoning is closed there, and the
             # answer continues from the prefix cache (the engine holds the prompt and the reasoning already).
             opener, end = core.empty_thinking[:2], core.empty_thinking[2]
-            _c, _r, _k, part = await collect(ids + opener, budget, sampling, [], True, parse=False, stop_ids_extra=(end,))
+            _c, _r, _k, part = await collect(ids + opener, budget, sampling, [], True, parse=False, extra=extra,
+                                             stop_ids_extra=(end,))
             reasoning_ids = [t for t in part["ids"] if t != end]
             thought = core.tok.decode(reasoning_ids, skip_special_tokens=True).strip()
             ids = ids + opener + reasoning_ids + [end]
             n = max(1, n - len(reasoning_ids))
         if body.get("stream"):
             return await openai_stream(request, ids, n, sampling, stops, body, chat=True,
-                                       close_thinking=budget is not None and budget >= 0)
+                                       close_thinking=budget is not None and budget >= 0, extra=extra)
         if budget is not None and budget >= 0 and core.empty_thinking:
             # The budget is spent: a reasoning block the model opens now is closed at once (it stops on the reasoning
             # token; the block is ended empty and the answer continues from the cache), at most a few times.
             think, end = core.empty_thinking[1], core.empty_thinking[2]
             content, reasoning, calls, final = "", "", [], None
             for _ in range(4):
-                c, r, k, part = await collect(ids, n, sampling, stops, bool(body.get("ignore_eos")), stop_ids_extra=(think,))
+                c, r, k, part = await collect(ids, n, sampling, stops, bool(body.get("ignore_eos")), extra=extra,
+                                              stop_ids_extra=(think,))
                 content += c; reasoning += r; calls += k
                 final = part if final is None else dict(part, completion_tokens=final["completion_tokens"] + part["completion_tokens"])
                 if part.get("stop_token") != think:
@@ -331,7 +423,7 @@ def add_routes(app: web.Application, core) -> None:
                 ids = ids + part["ids"] + [think, end]
                 n = max(1, n - part["completion_tokens"])
         else:
-            content, reasoning, calls, final = await collect(ids, n, sampling, stops, bool(body.get("ignore_eos")))
+            content, reasoning, calls, final = await collect(ids, n, sampling, stops, bool(body.get("ignore_eos")), extra=extra)
         reasoning = (thought + ("\n" + reasoning if reasoning else "")) if thought else reasoning
         message = {"role": "assistant", "content": content or (None if calls else "")}
         if reasoning:

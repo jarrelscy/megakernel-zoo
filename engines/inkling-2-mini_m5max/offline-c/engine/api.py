@@ -215,15 +215,23 @@ class Engine:
         return int(mk_target.sample_rows(logits.reshape(1, -1), s.sp, s.seed, mx.array([q], dtype=mx.int32), s.filt)[0].item())
 
     def submit(self, rid, prompt, n, sampling=None, embeds=None) -> None:
-        """embeds = (start, float32 [N, D]): prompt positions start .. start + N - 1 take these rows as their input
-        embeddings (the norm applied, as Inkling's embedding layer outputs them), e.g. projected audio; the prompt
-        holds any valid token there. They are never reused from the prefix cache."""
+        """embeds = (start, float32 [N, D]), or a list of (start, rows) or (start, rows, key): prompt positions start ..
+        start + N - 1 take these rows as their input embeddings (the norm applied, as Inkling's embedding layer outputs
+        them), e.g. projected audio or an image's vision features; the prompt holds any valid token there. A block with
+        a key (an integer naming its content, such as a hash of the image) is reused from the prefix cache by a later
+        prompt that has the same key at the same positions; one without is never reused."""
         prompt, n = [int(t) for t in prompt], int(n)
         if embeds is not None:
-            start, rows = int(embeds[0]), np.asarray(embeds[1], dtype=np.float32)
-            if rows.ndim != 2 or rows.shape[1] != 2304 or start < 0 or start + rows.shape[0] > len(prompt):
-                raise ValueError(f"request {rid!r}: embeddings {rows.shape} at {start} do not fit the prompt")
-            self.embeds[rid] = (start, rows)
+            blocks = [embeds] if not isinstance(embeds, list) else embeds
+            norm, end = [], 0
+            for block in sorted(blocks, key=lambda b: int(b[0])):
+                start, rows = int(block[0]), np.asarray(block[1], dtype=np.float32)
+                key = int(block[2]) if len(block) > 2 and block[2] is not None else None
+                if rows.ndim != 2 or rows.shape[1] != 2304 or start < end or start + rows.shape[0] > len(prompt):
+                    raise ValueError(f"request {rid!r}: embeddings {rows.shape} at {start} do not fit the prompt")
+                norm.append((start, rows, key))
+                end = start + rows.shape[0]
+            self.embeds[rid] = norm
         if len(prompt) < 1 or n < 1 or len(prompt) + n - 1 > self.max_context:
             raise ValueError(f"request {rid!r}: prompt {len(prompt)} + {n} new tokens exceeds {self.max_context} positions")
         if min(prompt) < 0 or max(prompt) >= 201024:
@@ -232,14 +240,15 @@ class Engine:
 
     def _prefill(self, prompt, embeds=None):
         """The prompt in wide passes of up to PF_CHUNK rows (the last few tokens, if fewer than 9 remain, in a pass of
-        the step's kernels); returns the first new token (lazy). embeds = (start, rows) relative to this prompt: every
-        pass is then a wide one, so the rows go in where the token embeddings would."""
+        the step's kernels); returns the first new token (lazy). embeds = [(start, rows), ...] relative to this prompt,
+        in order: every pass is then a wide one, so the rows go in where the token embeddings would."""
         tg = self.tg
         i, last = 0, None
-        while mk_target.PREFILL != "off" and (len(prompt) - i > 8 or (embeds is not None and i < len(prompt))):
+        first_at = embeds[0][0] if embeds else None
+        while mk_target.PREFILL != "off" and (len(prompt) - i > 8 or (embeds and i < len(prompt))):
             n = min(PF_CHUNK, len(prompt) - i)
-            if embeds is not None and i < embeds[0] < i + n:
-                n = embeds[0] - i           # a pass ends where the embeddings start: a snapshot there (below)
+            if first_at is not None and i < first_at < i + n:
+                n = first_at - i            # a pass ends where the embeddings start: a snapshot there (below)
             K = next(k for k in PF_BUCKETS if k >= n)
             if tg.pos + K > tg.T + 8:          # at the end of the context: no padding past it
                 if n < PF_BUCKETS[0]:
@@ -247,14 +256,17 @@ class Engine:
                 K = n = max(k for k in PF_BUCKETS if k <= n)
             p = tg.pos
             emb = None
-            if embeds is not None:
-                s0, rows = embeds
-                lo, hi = max(i, s0), min(i + n, s0 + rows.shape[0])
-                if lo < hi:
-                    block = np.zeros((K, rows.shape[1]), dtype=np.float32)
-                    use = np.zeros((K, 1), dtype=bool)
-                    block[lo - i:hi - i] = rows[lo - s0:hi - s0]
-                    use[lo - i:hi - i] = True
+            if embeds:
+                block = use = None
+                for s0, rows in embeds:
+                    lo, hi = max(i, s0), min(i + n, s0 + rows.shape[0])
+                    if lo < hi:
+                        if block is None:
+                            block = np.zeros((K, rows.shape[1]), dtype=np.float32)
+                            use = np.zeros((K, 1), dtype=bool)
+                        block[lo - i:hi - i] = rows[lo - s0:hi - s0]
+                        use[lo - i:hi - i] = True
+                if block is not None:
                     emb = (mx.array(block), mx.array(use))
             last, f = tg.prefill(prompt[i:i + n], K, want_feats=self.draft is not None, emb=emb)
             self._last_row = n - 1
@@ -262,7 +274,7 @@ class Engine:
                 self.draft.append(f, p, n)
             mx.async_eval(last, *self._state())
             i += n
-            if embeds is not None and i == embeds[0]:
+            if first_at is not None and i == first_at:
                 # where the embeddings start: the next request with the same text before its audio resumes here
                 tg.snaps[tg.pos] = list(tg.cw)
         while i < len(prompt):
@@ -326,29 +338,34 @@ class Engine:
             if not self.pending:
                 return events
             rid, prompt, n, samp = self.pending.pop(0)
-            embeds = self.embeds.pop(rid, None)
-            self._switch(prompt)
-            keep = self._begin(prompt, need_last=True)
+            blocks = self.embeds.pop(rid, None) or []
+            # the sequence as the cache knows it: each embedding position stands as an id no token has, the same for the
+            # same content (a block's key) and unique for a block without one, so a prompt only matches what it holds
+            key_prompt = list(prompt)
+            for start, rows, key in blocks:
+                for j in range(rows.shape[0]):
+                    if key is None:
+                        self._sentinel -= 1
+                        key_prompt[start + j] = self._sentinel
+                    else:
+                        key_prompt[start + j] = -(10**9 + (key % 10**12) * 10**5 + j)
+            self._switch(key_prompt)
+            keep = self._begin(key_prompt, need_last=True)
             self.request_info[rid] = {"cached_tokens": keep}
-            if embeds is not None:
-                # the cache can keep the context before the embeddings, never the embeddings themselves
-                if keep > embeds[0]:
-                    self._hard_reset(); keep = 0
-                    self.request_info[rid] = {"cached_tokens": 0}
-                first = self._prefill(prompt[keep:], (embeds[0] - keep, embeds[1]))
-            else:
-                first = self._prefill(prompt[keep:])
+            rel = []
+            for start, rows, _key in blocks:
+                if start + rows.shape[0] <= keep:
+                    continue                # already in the cache
+                cut = max(0, keep - start)
+                rel.append((start + cut - keep, rows[cut:]))
+            first = self._prefill(prompt[keep:], rel or None)
             # a snapshot at the end of the prompt: a later request that shares the prompt but not the answer resumes here
             self.tg.snaps[self.tg.pos] = list(self.tg.cw)
             if samp is not None:    # the first token, drawn from the logits of the last prompt row
                 first = mk_target.sample_rows(self.tg.row_logits(self._last_row), samp.sp, samp.seed,
                                               mx.array([len(prompt)], dtype=mx.int32), samp.filt)[0]
             spec = self.draft is not None and len(prompt) + n + 16 <= self.tg.T
-            hist = list(prompt)
-            if embeds is not None:      # positions given as embeddings are unique: a later prompt never matches them
-                for j in range(embeds[0], embeds[0] + embeds[1].shape[0]):
-                    self._sentinel -= 1
-                    hist[j] = self._sentinel
+            hist = key_prompt
             act = self.active = {"rid": rid, "n": n, "sent": 0, "tok": first, "spec": spec, "hist": hist, "samp": samp}
             self.cached = act["hist"]           # the prompt and every committed token after it, as the request goes on
             if spec:
