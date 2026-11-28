@@ -44,6 +44,10 @@ byte for byte as transformers renders it. A checkpoint that describes its answer
 (`reasoning_content`; Anthropic `thinking` blocks; Responses `reasoning` items; Ollama `thinking`), text, and tool
 calls (`tool_calls`; `tool_use` blocks; `function_call` items), with the finish reason each API uses for a tool call.
 Reasoning effort: `reasoning_effort`, `reasoning.effort`, Anthropic `thinking: {"type": "disabled"}`, Ollama `think`.
+Chat completions also take `thinking_budget` (reasoning tokens before the reasoning is closed and the model answers); the
+answer then carries `mk_reasoning_ids` and `mk_reasoning_cut`, and the same request sent again with the reasoning as a
+last assistant message and `"mk_continue_reasoning": true` goes on reasoning from those tokens for `thinking_budget`
+more (`mkserve/continuation.py`).
 `/v1/responses` keeps conversations in memory for `previous_response_id` (the newest 256). Images are refused (no
 engine has the vision tower yet).
 

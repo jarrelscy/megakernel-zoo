@@ -23,6 +23,8 @@ import uuid
 
 from aiohttp import web
 
+from mkserve.continuation import reasoning_after, split_continuation
+
 
 def _id(prefix: str) -> str:
     return f"{prefix}{uuid.uuid4().hex[:24]}"
@@ -421,6 +423,17 @@ def add_routes(app: web.Application, core) -> None:
             effort = body.get("reasoning_effort", kwargs.pop("reasoning_effort", None))
             if effort is None and kwargs.get("enable_thinking") is False:
                 effort = False  # Qwen's switch, as clients send it: for a template that takes reasoning_effort (Inkling 2), effort "none"
+            # mk_continue_reasoning (mkserve/continuation.py): the last message is the assistant's reasoning so far, which
+            # the budget cut; the conversation before it is rendered as the first request rendered it, and the reasoning
+            # goes on from those tokens
+            prior: list[int] | None = None
+            if body.get("mk_continue_reasoning"):
+                if body.get("stream") or body.get("mk_warm"):
+                    return error("mk_continue_reasoning: only for an unstreamed answer")
+                if not core.empty_thinking:
+                    return error("mk_continue_reasoning: this model has no reasoning markers")
+                messages, prior = split_continuation(messages, lambda t: core.tok.encode(t, add_special_tokens=False).ids,
+                                                     core.empty_thinking[2])
             images: list = []
             ids = core.render(openai_messages(messages, images), tools, reasoning_effort=_effort(effort), **kwargs)
             extra = None
@@ -452,24 +465,29 @@ def add_routes(app: web.Application, core) -> None:
             # thinking_budget 0 (mkserve's own field, also in chat_template_kwargs): the answer starts after an empty reasoning
             # block, so the model writes its tool calls or text at once. For simple turns such as filing a dictated phrase.
             budget = int(budget) if budget is not None else None
+            if prior is not None and not (budget and budget > 0):
+                return error("mk_continue_reasoning: needs a thinking_budget above 0 (the new reasoning tokens allowed)")
             if budget == 0 and core.empty_thinking:
                 ids = ids + core.empty_thinking
             n, sampling, stops = common(body)
         except ValueError as exc:
             return error(str(exc))
-        if (why := core.check(ids, n)):
+        if (why := core.check(ids + (core.empty_thinking[:2] + prior if prior else []), n)):
             return error(why)
         thought = ""
+        reasoning_ids, reasoning_cut = None, False
         if budget and budget > 0 and core.empty_thinking:
             # A reasoning budget: the model reasons for at most `budget` tokens, the reasoning is closed there, and the
-            # answer continues from the prefix cache (the engine holds the prompt and the reasoning already).
+            # answer continues from the prefix cache (the engine holds the prompt and the reasoning already). Continuing
+            # a reasoning (prior), it starts after the reasoning so far and `budget` counts only the new tokens.
             opener, end = core.empty_thinking[:2], core.empty_thinking[2]
-            _c, _r, _k, part = await collect(ids + opener, budget, sampling, [], True, parse=False, extra=extra,
+            before = prior or []
+            _c, _r, _k, part = await collect(ids + opener + before, budget, sampling, [], True, parse=False, extra=extra,
                                              stop_ids_extra=(end,))
-            reasoning_ids = [t for t in part["ids"] if t != end]
+            reasoning_ids, reasoning_cut = reasoning_after(before, part["ids"], end)
             thought = core.tok.decode(reasoning_ids, skip_special_tokens=True).strip()
             ids = ids + opener + reasoning_ids + [end]
-            n = max(1, n - len(reasoning_ids))
+            n = max(1, n - (len(reasoning_ids) - len(before)))
         # tool_choice naming one function ({"type": "function", "function": {"name": ...}}, or "required" with one tool): once
         # the reasoning is closed, the answer is opened as a call of it, so the model cannot announce the call or stop
         prime, forced = "", None
@@ -507,6 +525,11 @@ def add_routes(app: web.Application, core) -> None:
         message = {"role": "assistant", "content": content or (None if calls else "")}
         if reasoning:
             message["reasoning_content"] = reasoning
+        if reasoning_ids is not None:
+            # the budgeted reasoning's own tokens and whether the budget cut it: what a request with mk_continue_reasoning
+            # sends back to go on reasoning (mkserve/continuation.py)
+            message["mk_reasoning_ids"] = reasoning_ids
+            message["mk_reasoning_cut"] = reasoning_cut
         if calls:
             message["tool_calls"] = [openai_call(c) for c in calls]
         finish = "tool_calls" if calls and final["finish"] == "stop" else final["finish"]
