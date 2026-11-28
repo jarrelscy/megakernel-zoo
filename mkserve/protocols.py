@@ -426,6 +426,21 @@ def add_routes(app: web.Application, core) -> None:
             extra = None
             if images:
                 ids, extra = await expand_images(ids, images)
+            if body.get("mk_warm"):
+                # a cache warm-up: the prompt up to its last audio or image part (a dictation turn's text, known before
+                # the radiologist stops speaking; the last part may be a placeholder with no frames yet) is prefilled now,
+                # so the turn that follows with the same text and the real audio prefills only the audio and what follows
+                media = (extra or {}).get("media") or []
+                if not media:
+                    return error("mk_warm: the prompt has no audio or image part to stop at")
+                cut = int(media[-1]["at"])
+                warm = {"wide": True}
+                if media[:-1]:
+                    warm["media"] = media[:-1]
+                if (why := core.check(ids[:cut], 1)):
+                    return error(why)
+                _c, _r, _k, final = await collect(ids[:cut], 1, None, [], True, parse=False, extra=warm)
+                return web.json_response({"object": "mk.warm", "prompt_tokens": cut, "cached_tokens": final["cached_tokens"]})
             # thinking_budget 0 (mkserve's own field, also in chat_template_kwargs): the answer starts after an empty reasoning
             # block, so the model writes its tool calls or text at once. For simple turns such as filing a dictated phrase.
             budget = int(budget) if budget is not None else None

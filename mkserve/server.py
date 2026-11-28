@@ -76,6 +76,18 @@ def engine_main(args) -> int:
     os.chdir(args.workspace)
     engine = load_engine(args.workspace, args.model_dir, args.max_batch, args.max_context)
     has_native = all(hasattr(engine, m) for m in ("submit", "poll"))
+    import inspect
+    _sub = set(inspect.signature(engine.submit).parameters) if hasattr(engine, "submit") else set()
+
+    def opts(req) -> dict:
+        """Optional submit() keywords an engine declares: stops (the request's stop token ids: the engine ends the request
+        on one instead of decoding on until the cancel arrives) and wide (every prompt pass a wide one: a cache warm-up)."""
+        kw = {}
+        if "stops" in _sub and req.get("eos"):
+            kw["stops"] = [int(t) for t in req["eos"]]
+        if "wide" in _sub and req.get("wide"):
+            kw["wide"] = True
+        return kw
     mode = args.mode if args.mode != "auto" else ("native" if has_native else "step")
     if mode == "native" and not has_native:
         print("MKSERVE this engine has no submit()/poll(): using step mode", flush=True)
@@ -109,6 +121,7 @@ def engine_main(args) -> int:
         conn.sendall((json.dumps(events, separators=(",", ":")) + "\n").encode())
 
     if mode == "native":
+        audio_rows: dict = {}   # media key -> projected rows: a conversation resends every earlier turn's audio each request
         while True:
             while True:
                 try:
@@ -126,7 +139,7 @@ def engine_main(args) -> int:
                     a = req["audio"]
                     try:
                         rows = engine.project_audio(a["frames"], int(a["count"]))
-                        engine.submit(req["rid"], req["ids"], req["n"], embeds=(int(a["at"]), rows))
+                        engine.submit(req["rid"], req["ids"], req["n"], embeds=(int(a["at"]), rows), **opts(req))
                     except Exception as exc:  # noqa: BLE001  a bad request must not stop the engine
                         print(f"MKSERVE audio request {req['rid']} refused: {exc}", flush=True)
                         send([[int(req["rid"]), [], True]])
@@ -141,19 +154,25 @@ def engine_main(args) -> int:
                                 rows = _np.frombuffer(_b64.b64decode(m["rows"]), dtype="<f2").astype(_np.float32)
                                 rows = rows.reshape(int(m["count"]), -1)
                             else:
-                                rows = engine.project_audio(m["frames"], int(m["frame_count"]))
+                                ck = (int(m["key"]), int(m["frame_count"]))
+                                rows = audio_rows.pop(ck, None)         # popped and put back: least recently used first
+                                if rows is None:
+                                    rows = engine.project_audio(m["frames"], int(m["frame_count"]))
+                                audio_rows[ck] = rows
+                                while sum(r.nbytes for r in audio_rows.values()) > (1 << 30):     # 1 GB
+                                    audio_rows.pop(next(iter(audio_rows)))
                                 if rows.shape[0] != int(m["count"]):
                                     raise ValueError(f"audio: {rows.shape[0]} projected rows for {m['count']} positions")
                             blocks.append((int(m["at"]), rows, int(m["key"])))
-                        engine.submit(req["rid"], req["ids"], req["n"], embeds=blocks)
+                        engine.submit(req["rid"], req["ids"], req["n"], embeds=blocks, **opts(req))
                     except Exception as exc:  # noqa: BLE001  a bad request must not stop the engine
                         print(f"MKSERVE media request {req['rid']} refused: {exc}", flush=True)
                         send([[int(req["rid"]), [], True]])
                     continue
                 if samp and getattr(engine, "native_sampling", False):  # the engine draws tokens inside its own path
-                    engine.submit(req["rid"], req["ids"], req["n"], sampling=samp)
+                    engine.submit(req["rid"], req["ids"], req["n"], sampling=samp, **opts(req))
                 else:
-                    engine.submit(req["rid"], req["ids"], req["n"])
+                    engine.submit(req["rid"], req["ids"], req["n"], **opts(req))
             events = engine.poll()
             if events:
                 info = getattr(engine, "request_info", None) or {}  # optional: per-request facts (prompt tokens kept from a prefix cache)

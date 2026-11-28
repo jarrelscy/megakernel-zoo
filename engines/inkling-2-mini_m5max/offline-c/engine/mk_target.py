@@ -414,6 +414,7 @@ class Target:
         knew, vnew, wins, K = self.pending
         p, b = self.pos, self.base
         self._snap(p, n_acc, wins)
+        self.last_commit = (p, wins, n_acc)     # (api.py: a snapshot at a stop token inside these rows)
         self.kr[:, p - b:p - b + n_acc] = knew[:, :n_acc] if n_acc < K else knew
         self.vr[:, p - b:p - b + n_acc] = vnew[:, :n_acc] if n_acc < K else vnew
         self.cw = [w[:, n_acc:n_acc + 3] for w in wins]

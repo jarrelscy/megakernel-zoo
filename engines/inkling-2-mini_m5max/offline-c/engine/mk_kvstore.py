@@ -42,6 +42,11 @@ class KVStore:
         self.disk_budget = float(os.environ.get("MK_KV_DISK_GB", "96")) * GB
         self.dir = Path(os.environ.get("MK_KV_DIR", str(Path.home() / "Library/Caches/mkserve/kv"))) / model_key
         self.enabled = os.environ.get("MK_KV_SLOTS", "1") != "0"
+        # MK_KV_LAZY_FIT: the memory budget is enforced when the engine is idle (Engine.poll with nothing to do), not
+        # inside park(): an entry written to the SSD (~3 GB at 5 passes and 10K positions, 0.27-0.39 s) is then never on
+        # a request's path. Memory runs over the budget by the entries parked since the last idle moment
+        self.lazy_fit = os.environ.get("MK_KV_LAZY_FIT", "1") == "1"
+        self.dirty = False
         self.entries: list[dict] = []          # newest last
         self.stats = {"parked": 0, "restored": 0, "to_disk": 0, "from_disk": 0, "restore_s": 0.0, "park_s": 0.0}
         if self.enabled and self.disk_budget > 0:
@@ -96,7 +101,11 @@ class KVStore:
                              "bytes": nbytes, "used": time.time()})
         self.stats["parked"] += 1
         self.stats["park_s"] += time.perf_counter() - t0
-        self._fit()
+        # lazy, but never past twice the budget (back-to-back requests that each park would otherwise grow without bound)
+        if self.lazy_fit and sum(e["bytes"] for e in self.entries if "k" in e) <= 2 * self.ram_budget:
+            self.dirty = True
+        else:
+            self._fit()
 
     def restore(self, e: dict, tg, draft) -> list:
         """Make entry e the live sequence (the caller has parked or dropped the live one); returns its tokens."""
@@ -128,6 +137,12 @@ class KVStore:
         return e["tokens"]
 
     # ------------------------------------------------------------------------------------------ tiers
+    def idle(self):
+        """The engine has nothing to do: enforce the budget now (see lazy_fit)."""
+        if self.dirty:
+            self.dirty = False
+            self._fit()
+
     def _fit(self):
         """Keep memory under its budget: the least recently used entries go to the SSD (or are dropped)."""
         while sum(e["bytes"] for e in self.entries if "k" in e) > self.ram_budget:

@@ -37,6 +37,11 @@ PF_BUCKETS = [k for k in (int(v) for v in os.environ.get("MK_PF_BUCKETS", "64,12
 # MK_PF_MIN: a remainder of at most this many tokens goes through the step's kernels (8 rows a pass) instead of a padded
 # wide pass (at a 14K-position context, 9-16 new tokens: 41-58 ms in steps, 78 ms in a 64-row pass)
 PF_MIN = int(os.environ.get("MK_PF_MIN", "16"))
+# MK_TURN_PROF: one line per request start: where the time to the first token goes (synchronizes between the steps:
+# for measurement only, it costs the overlap of host and GPU work)
+TURN_PROF = os.environ.get("MK_TURN_PROF", "0") == "1"
+# MK_ENGINE_STOPS=0: submit()'s stop tokens are ignored (the request decodes on until mkserve's cancel, as before)
+ENGINE_STOPS = os.environ.get("MK_ENGINE_STOPS", "1") == "1"
 
 
 class Engine:
@@ -74,9 +79,11 @@ class Engine:
         self._stale = False         # reset() was called: the state is kept until the next sequence shows its first tokens
         self.request_info = {}      # rid -> {"cached_tokens": prompt tokens kept from the cache} (mkserve reads and removes it)
         self.embeds = {}            # rid -> (start, rows): input embeddings for part of a waiting request's prompt
+        self.opts = {}              # rid -> {"stops": set of token ids, "wide": bool} (submit()'s options)
         from mk_kvstore import KVStore
         self.kv = KVStore(f"{Path(model_dir).name}-{self.tg.passes}p")   # parked sequences (memory, then the SSD)
         self._sentinel = 0          # stand-ins for embedding positions in the cached token list: never match a prompt
+        self._busy_t = 0.0          # when the last request started or ended (KVStore.idle)
         self.load_seconds = time.time() - t0
         self._warm()
 
@@ -232,7 +239,7 @@ class Engine:
         s = sampling if hasattr(sampling, "sp") else self._sampling(sampling)
         return int(mk_target.sample_rows(logits.reshape(1, -1), s.sp, s.seed, mx.array([q], dtype=mx.int32), s.filt)[0].item())
 
-    def submit(self, rid, prompt, n, sampling=None, embeds=None) -> None:
+    def submit(self, rid, prompt, n, sampling=None, embeds=None, stops=None, wide=False) -> None:
         """embeds = (start, float32 [N, D]), or a list of (start, rows) or (start, rows, key): prompt positions start ..
         start + N - 1 take these rows as their input embeddings (the norm applied, as Inkling's embedding layer outputs
         them), e.g. projected audio or an image's vision features; the prompt holds any valid token there. A block with
@@ -254,6 +261,9 @@ class Engine:
             raise ValueError(f"request {rid!r}: prompt {len(prompt)} + {n} new tokens exceeds {self.max_context} positions")
         if min(prompt) < 0 or max(prompt) >= 201024:
             raise ValueError(f"request {rid!r}: token id out of range")
+        stops = stops if ENGINE_STOPS else None
+        if stops or wide:
+            self.opts[rid] = {"stops": set(int(t) for t in stops or ()), "wide": bool(wide)}
         self.pending.append((rid, prompt, n, self._sampling(sampling)))
 
     def _pf_chunk(self) -> int:
@@ -264,14 +274,16 @@ class Engine:
         fits = [k for k in PF_BUCKETS if k <= PF_CHUNK and 96 * k * (p + k + 1) <= budget]
         return max(fits + [min(256, PF_CHUNK)])
 
-    def _prefill(self, prompt, embeds=None):
+    def _prefill(self, prompt, embeds=None, wide=False):
         """The prompt in wide passes of up to PF_CHUNK rows (the last few tokens, if at most PF_MIN remain, in passes of
         the step's kernels); returns the first new token (lazy). embeds = [(start, rows), ...] relative to this prompt,
-        in order: every pass is then a wide one, so the rows go in where the token embeddings would."""
+        in order: every pass is then a wide one, so the rows go in where the token embeddings would. wide: every pass a
+        wide one without embeddings too (a cache warm-up that stops where a media block will start: the pass that ends
+        there is the one the request with the media would run, so its K/V are the same bits)."""
         tg = self.tg
         i, last = 0, None
         first_at = embeds[0][0] if embeds else None
-        while mk_target.PREFILL != "off" and (len(prompt) - i > PF_MIN or (embeds and i < len(prompt))):
+        while mk_target.PREFILL != "off" and (len(prompt) - i > PF_MIN or ((embeds or wide) and i < len(prompt))):
             n = min(self._pf_chunk(), len(prompt) - i)
             if first_at is not None and i < first_at < i + n:
                 n = first_at - i            # a pass ends where the embeddings start: a snapshot there (below)
@@ -295,6 +307,8 @@ class Engine:
                 if block is not None:
                     emb = (mx.array(block), mx.array(use))
             last, f = tg.prefill(prompt[i:i + n], K, want_feats=self.draft is not None, emb=emb)
+            if TURN_PROF and hasattr(self, "_pf_log"):
+                self._pf_log.append((n, K))
             self._last_row = n - 1
             if self.draft is not None:
                 self.draft.append(f, p, n)
@@ -354,9 +368,11 @@ class Engine:
         after its current cycle (its K/V stays as the cache of the next request)."""
         self.pending = [r for r in self.pending if r[0] != rid]
         self.embeds.pop(rid, None)
+        self.opts.pop(rid, None)
         if self.active is not None and self.active["rid"] == rid:
             self._dump(self.active)
             self.active = None
+            self._busy_t = time.perf_counter()
 
     @staticmethod
     def _dump(act) -> None:
@@ -369,9 +385,20 @@ class Engine:
         act = self.active
         if act is None:
             if not self.pending:
+                # parked entries over the memory budget go to the SSD once the engine has been idle a while (not in the
+                # few ms between a reasoning request and its answer)
+                if self.kv.dirty and time.perf_counter() - self._busy_t > 0.5:
+                    t0 = time.perf_counter()
+                    self.kv.idle()
+                    if os.environ.get("MK_KV_LOG"):
+                        print(f"MK_KV idle fit {time.perf_counter() - t0:.3f} s {self.kv.summary()}", flush=True)
                 return events
+            self._busy_t = time.perf_counter()
             rid, prompt, n, samp = self.pending.pop(0)
+            tp = [time.perf_counter()] if TURN_PROF else None
+            kv0 = (self.kv.stats["parked"], self.kv.stats["restored"], self.kv.stats["to_disk"], self.kv.stats["from_disk"]) if TURN_PROF else None
             blocks = self.embeds.pop(rid, None) or []
+            opt = self.opts.pop(rid, None) or {}
             # the sequence as the cache knows it: each embedding position stands as an id no token has, the same for the
             # same content (a block's key) and unique for a block without one, so a prompt only matches what it holds
             key_prompt = list(prompt)
@@ -382,8 +409,22 @@ class Engine:
                         key_prompt[start + j] = self._sentinel
                     else:
                         key_prompt[start + j] = -(10**9 + (key % 10**12) * 10**5 + j)
+            L = len(key_prompt)
+            if (opt.get("wide") and self.cached is not None and L in self.tg.snaps and self.tg.pos >= L
+                    and self.tg.pending is None and self.cached[:L] == key_prompt):
+                # a warm-up of a prompt the live sequence holds already (a repeated warm-up): nothing to do. Running it
+                # would cut back to an earlier snapshot and prefill from there in other passes than the turn would
+                self.request_info[rid] = {"cached_tokens": L}
+                events.append((rid, [], True))
+                return events
+            if TURN_PROF:
+                tp.append(time.perf_counter())
             self._switch(key_prompt)
+            if TURN_PROF:
+                mx.synchronize(); tp.append(time.perf_counter())
             keep = self._begin(key_prompt, need_last=True)
+            if TURN_PROF:
+                mx.synchronize(); tp.append(time.perf_counter()); self._pf_log = []
             self.request_info[rid] = {"cached_tokens": keep}
             rel = []
             for start, rows, _key in blocks:
@@ -391,7 +432,17 @@ class Engine:
                     continue                # already in the cache
                 cut = max(0, keep - start)
                 rel.append((start + cut - keep, rows[cut:]))
-            first = self._prefill(prompt[keep:], rel or None)
+            if opt.get("wide") and rel:
+                # a warm-up whose prompt holds media the cache lacks: the turn's own request ends a pass only where its
+                # first such block starts and runs on across the end of this prompt, so the warm-up stops at that block
+                # (the same passes, the same bits) and the turn prefills the rest
+                end = keep + rel[0][0]
+                prompt, key_prompt, rel = prompt[:end], key_prompt[:end], []
+                if end == keep:
+                    self.cached = key_prompt
+                    events.append((rid, [], True))
+                    return events
+            first = self._prefill(prompt[keep:], rel or None, wide=bool(opt.get("wide")))
             # a snapshot at the end of the prompt: a later request that shares the prompt but not the answer resumes here
             self.tg.snaps[self.tg.pos] = list(self.tg.cw)
             if samp is not None:    # the first token, drawn from the logits of the last prompt row
@@ -400,19 +451,28 @@ class Engine:
             spec = self.draft is not None and len(prompt) + n + 16 <= self.tg.T
             hist = key_prompt
             act = self.active = {"rid": rid, "n": n, "sent": 0, "tok": first, "spec": spec, "hist": hist, "samp": samp,
-                                 "plen": len(hist)}
+                                 "plen": len(hist), "stops": opt.get("stops")}
             self.cached = act["hist"]           # the prompt and every committed token after it, as the request goes on
             if spec:
                 from mk_draft import Cal
                 act["cal"] = Cal()
             t = int(first.item())
             self.counters["host_syncs"] += 1
+            if TURN_PROF:
+                tp.append(time.perf_counter())
+                kv1 = (self.kv.stats["parked"], self.kv.stats["restored"], self.kv.stats["to_disk"], self.kv.stats["from_disk"])
+                d = [round(1e3 * (b - a), 1) for a, b in zip(tp, tp[1:])]
+                print(f"MK_TURN{' warm' if opt.get('wide') else ''} prompt {len(prompt)} kept {keep} new {len(prompt) - keep} media {len(blocks)}/{len(rel)} | keys {d[0]} ms"
+                      f" switch {d[1]} ms (park/restore/to_disk/from_disk +{[b - a for a, b in zip(kv0, kv1)]}) begin {d[2]} ms"
+                      f" prefill+first {d[3]} ms passes {self._pf_log}", flush=True)
             act["sent"] = 1
             act["last"] = t
             act["hist"].append(t)
-            events.append((rid, [t], n == 1))
-            if n == 1:
+            fin = n == 1 or bool(act["stops"] and t in act["stops"])
+            events.append((rid, [t], fin))
+            if fin:
                 self.active = None
+                self._busy_t = time.perf_counter()
             return events
         left = act["n"] - act["sent"]
         if act["spec"]:
@@ -433,6 +493,13 @@ class Engine:
             act["hist"].extend(toks)
             self.counters["host_syncs"] += 1
         toks = toks[:left]
+        stops = act.get("stops")
+        if stops:
+            j = next((i for i, v in enumerate(toks) if v in stops), None)
+            if j is not None:          # a stop token: the request ends here, not a cancel round trip (a cycle) later
+                self._snap_at_stop(j, len(toks))
+                toks = toks[:j + 1]
+                act["n"] = act["sent"] + len(toks)
         act["sent"] += len(toks)
         act["last"] = toks[-1]
         self.counters["cycles"] += 1
@@ -442,7 +509,26 @@ class Engine:
         if done:
             self._dump(act)
             self.active = None
+            self._busy_t = time.perf_counter()
         return events
+
+    def _snap_at_stop(self, j: int, m: int) -> None:
+        """Token j of the m tokens the last commit gave is a stop token: a snapshot at its position, where a continuation
+        that ends with it resumes (the answer after a closed reasoning block: its prompt is the reasoning and the closing
+        token) instead of at the last 256-position snapshot. The conv windows are the pass's own (rows j + 1 .. j + 3, as
+        Target._snap takes them); the K/V of positions past it stay and are never read by that continuation."""
+        tg = self.tg
+        lc = getattr(tg, "last_commit", None)
+        if lc is None or j >= m - 1:
+            return              # the stop token is the last one committed: _switch() snapshots tg.pos
+        p0, wins, n_acc = lc
+        if n_acc != m or p0 + n_acc != tg.pos:
+            return
+        q = p0 + j + 1
+        if q not in tg.snaps:
+            s = [mx.contiguous(w[:, j + 1:j + 4]) for w in wins]
+            tg.snaps[q] = s
+            mx.async_eval(*s)
 
     def close(self) -> None:
         self.tg = None
