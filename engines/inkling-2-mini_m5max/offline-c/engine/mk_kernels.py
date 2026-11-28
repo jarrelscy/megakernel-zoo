@@ -431,7 +431,9 @@ def attention_gate(q, kc, vc, krec, vrec, knew, vnew, rel, proj, sinks, meta, ap
     (the target keeps the big tier as one array per application, [1, T, 1024], and the recent tier as one array). A context beyond ATT_SMAX keys: a local layer needs scores for
     its window only; a global one keeps them in a device buffer (the same statements otherwise: the same bits)."""
     K = q.shape[0]
-    if ATT_SHARED and (not local or ATT_SHARED_LOCAL):
+    # up to 16 rows (every decode and verify pass): the chunk partials are sized for the whole context, ~100 MB at 16 rows
+    # and 131K positions; a wide exact-prefill pass of 256 rows would need 1.6 GB per visit
+    if ATT_SHARED and K <= 16 and (not local or ATT_SHARED_LOCAL):
         return attention_shared(q, kc, vc, krec, vrec, knew, vnew, rel, proj, sinks, meta, app, gate, smax, local)
     rtg = ATT_RTG if K < ATT_WIDE else 256
     projt = proj.shape[0] == 1024           # [1024, 16] (transposed at load) or the stored [16, 1024]
