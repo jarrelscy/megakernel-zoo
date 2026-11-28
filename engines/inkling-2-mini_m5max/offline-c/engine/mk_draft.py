@@ -698,7 +698,7 @@ class Draft:
 # builds copy proposals that know where a copied string ends (its closing quote), what comes after the value (the same
 # keys and punctuation as the last time a value of that key closed), and what the next value likely starts with. Only
 # proposals: the verify pass decides every token. An answer that does not start with { or [ gets none.
-JSON_COPY = os.environ.get("MK_JSON_COPY", "0") == "1"      # off by default: see the commit message
+JSON_COPY = os.environ.get("MK_JSON_COPY", "1") == "1"      # on: +17% on tool-call answers; rare wording differences from strict greedy output (verify-pass grouping), MK_JSON_COPY=0 turns it off
 JC_STRUCT = os.environ.get("MK_JC_STRUCT", "1") == "1"       # the keys and punctuation after a value closes
 JC_VALUE = os.environ.get("MK_JC_VALUE", "1") == "1"         # a value from its key's context as soon as it opens
 JC_PFX = int(os.environ.get("MK_JC_PFX", "1"))               # complete a string from its first JC_PFX+ tokens (0: off)
