@@ -524,17 +524,34 @@ class Target:
         else:
             h, w2 = kn.sconv2(ao, cw[2], L["a_conv"], add=hidden)
         srcs = blocks + [h]
+        # the router GEMV, top-8 and the experts' slot plan in one dispatch (kernels: route); its counter is zeroed
+        # by the kernel that produces the router's input
+        r1 = kn.ROUTE1 and K < WIDE_MIN and not WHATIF_NO and (msgs is None or not (GATE2 or GATE3))
+        zc = plan = None
         if msgs is None:
-            x16 = kn.mix2(srcs, L["mq2"], norm_in=True, wt=L["mnw"])[:, 0]
+            if r1:
+                y_, zc = kn.mix2(srcs, L["mq2"], norm_in=True, wt=L["mnw"], zc=True)
+                x16 = y_[:, 0]
+            else:
+                x16 = kn.mix2(srcs, L["mq2"], norm_in=True, wt=L["mnw"])[:, 0]
         else:
             if GATE3:
                 xm, _, st_ = kn.mix2g(srcs, L["mq2"], msgs, 1, 3)
                 x16 = kn.gates3(st_, xm, msgs, L["c_down1"], L["c_fg1"], L["mnw"], 3)[0]
             else:
               xm = kn.mix2(srcs, L["mq2"], norm_in=True)
-              x16 = (kn.gates2(xm, msgs, L["c_down1"], L["c_ft1"], L["mnw"], 3) if GATE2 else
-                   kn.gates(xm, msgs, L["c_down1"], L["c_fg1"], L["mnw"], 3))[0]
-        idx, wts = kn.router(kn.gemv(L["router"], x16), L["rbias"])
+              if GATE2:
+                  x16 = kn.gates2(xm, msgs, L["c_down1"], L["c_ft1"], L["mnw"], 3)[0]
+              elif r1:
+                  x16, zc = kn.gates(xm, msgs, L["c_down1"], L["c_fg1"], L["mnw"], 3, zc=True)
+              else:
+                  x16 = kn.gates(xm, msgs, L["c_down1"], L["c_fg1"], L["mnw"], 3)[0]
+        if r1:
+            lay = expert_layout(K)
+            idx, wts, se, sp = kn.route(L["router"], x16, L["rbias"], zc, lay[0])
+            plan = (se, sp)
+        else:
+            idx, wts = kn.router(kn.gemv(L["router"], x16), L["rbias"])
         if "experts" in WHATIF_NO:
             y = kn.fill(x16, 2304) * (1.0 + 0.0 * wts[:, :1]) + 0.0 * idx[:, :1].astype(F32)
         elif K >= WIDE_MIN and PREFILL == "fast":
@@ -542,7 +559,7 @@ class Target:
         elif K >= WIDE_MIN:
             y = kn.experts2(L["fmt"], L["w13"], L["s13"], L["g13"], L["w2"], L["s2"], L["g2"], x16, idx, wts, PF_M, 1, 4, True)
         else:
-            y = kn.experts2(L["fmt"], L["w13"], L["s13"], L["g13"], L["w2"], L["s2"], L["g2"], x16, idx, wts, *expert_layout(K))
+            y = kn.experts2(L["fmt"], L["w13"], L["s13"], L["g13"], L["w2"], L["s2"], L["g2"], x16, idx, wts, *expert_layout(K), plan=plan)
         out, w3 = kn.sconv2(y, cw[3], L["m_conv"], add=h)
         for _ in range(PAD):                     # timing experiment only: dependent trivial dispatches
             out = kn.ident(out)
@@ -606,8 +623,9 @@ class Target:
             if lp > 0:
                 bank_blocks, bank_part = blocks[len(pre_blocks) + 1:], rms(h)
                 h, blocks = pre_h, pre_blocks
+            allm = kn.mix_all(bank_blocks + [bank_part], self.msg_query) if lp > 0 and kn.MSGM else None
             for j, i in enumerate(self.core):
-                msgs = msg_mix(bank_blocks + [bank_part], self.msg_query[j]) if lp > 0 else None
+                msgs = (allm[j] if allm is not None else msg_mix(bank_blocks + [bank_part], self.msg_query[j])) if lp > 0 else None
                 if v in taps: feats.append(h)
                 h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, msgs, meta, K, knew, vnew, wins); a += 1; v += 1
         a = cs + self.passes * len(self.core)
@@ -693,8 +711,9 @@ class Target:
                 bank_blocks = blocks[len(pre_blocks) + 1:]
             bank_part = rms(h)
             h, blocks = pre_h, pre_blocks
+            allm = kn.mix_all(bank_blocks + [bank_part], self.msg_query) if kn.MSGM else None
             for j, i in enumerate(self.core):
-                msgs = msg_mix(bank_blocks + [bank_part], self.msg_query[j])
+                msgs = allm[j] if allm is not None else msg_mix(bank_blocks + [bank_part], self.msg_query[j])
                 if a in self.taps: feats.append(h)
                 h, blocks = self._lay(a, a, i, h, blocks, msgs, meta, K, kc, vc, kr, vr, cw, knew, vnew, wins); a += 1
         for i in range(ce, len(self.layers)):

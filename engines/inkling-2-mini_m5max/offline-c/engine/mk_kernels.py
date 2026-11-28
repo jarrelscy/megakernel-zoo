@@ -840,12 +840,17 @@ _comb = mx.fast.metal_kernel(name="mk_comb", input_names=["o", "wts"], output_na
 _up2, _down2 = {}, {}
 
 
-def experts2(fmt: str, w13, s13, g13, w2, s2, g2, x16, idx, wts, M: int, RU: int = 2, RD: int = 2, BR: bool = False) -> mx.array:
-    """As experts(), each distinct expert read once per slot of up to M (row, expert) pairs."""
+def experts2(fmt: str, w13, s13, g13, w2, s2, g2, x16, idx, wts, M: int, RU: int = 2, RD: int = 2, BR: bool = False,
+             plan=None) -> mx.array:
+    """As experts(), each distinct expert read once per slot of up to M (row, expert) pairs. plan: (slot_e, slot_p) from
+    route() (the same values mk_plan computes)."""
     K = x16.shape[0]
     S = min(8 * K, 128) if K <= 16 else 128 + 8 * K // M         # wide passes: sum over experts of ceil(pairs / M)
-    slot_e, slot_p = _plan(inputs=[idx], template=[("KM", K), ("NP", 8 * K), ("M", M), ("S", S)], grid=(128, 1, 1),
-                           threadgroup=(128, 1, 1), output_shapes=[(S,), (S, M)], output_dtypes=[mx.uint32, mx.uint32])
+    if plan is not None:
+        slot_e, slot_p = plan
+    else:
+        slot_e, slot_p = _plan(inputs=[idx], template=[("KM", K), ("NP", 8 * K), ("M", M), ("S", S)], grid=(128, 1, 1),
+                               threadgroup=(128, 1, 1), output_shapes=[(S,), (S, M)], output_dtypes=[mx.uint32, mx.uint32])
     ku = _up2.get((fmt, M, RU, BR)) or _up2.setdefault((fmt, M, RU, BR), _make_up2(fmt, M, RU, BR))
     kd = _down2.get((fmt, M, RD, BR)) or _down2.setdefault((fmt, M, RD, BR), _make_down2(fmt, M, RD, BR))
     h = ku(inputs=[w13, s13, g13, x16, slot_e, slot_p], grid=(S * (1152 // RU) * 32, 1, 1), threadgroup=(256, 1, 1),
@@ -1152,7 +1157,7 @@ inline float tgget(threadgroup float* buf) {
 """
 
 
-def _make_mix2(N: int, Q: int, norm_in: bool, pout: bool, wout: bool):
+def _make_mix2(N: int, Q: int, norm_in: bool, pout: bool, wout: bool, zc: bool = False):
     """Depth mix with the neighbours folded in. Sources b0..b{N-1}; the last one is the partial, RMS-normalized here
     when norm_in. Outputs: out [K, Q, D] float32 (unless wout), pn [K, D] (the normalized partial, when pout),
     y [K, Q, D] half bits = rms_norm(out_j) * wt[j] (when wout)."""
@@ -1201,8 +1206,10 @@ def _make_mix2(N: int, Q: int, norm_in: bool, pout: bool, wout: bool):
 {dots}
 {outs}
 """
-    onames = ([] if wout else ["out"]) + (["pn"] if pout else []) + (["y"] if wout else [])
-    return mx.fast.metal_kernel(name=f"mk_mix2_{N}_{Q}_{int(norm_in)}{int(pout)}{int(wout)}", input_names=names + ["qs"] + (["wt"] if wout else []),
+    onames = ([] if wout else ["out"]) + (["pn"] if pout else []) + (["y"] if wout else []) + (["zc"] if zc else [])
+    if zc:
+        src += "    if (row == 0 && tid == 0) zc[0] = 0u;\n"
+    return mx.fast.metal_kernel(name=f"mk_mix2_{N}_{Q}_{int(norm_in)}{int(pout)}{int(wout)}{'z' if zc else ''}", input_names=names + ["qs"] + (["wt"] if wout else []),
                                 output_names=onames, source=src, header=_TGHDR2)
 
 
@@ -1267,12 +1274,16 @@ import os as _os5
 MIXF = _os5.environ.get("MK_MIXF", "0") == "1"       # bit-equal and 2x faster alone, no gain in a pass (journal): off
 
 
-def mix2(sources: list, queries: mx.array, norm_in: bool = False, pout: bool = False, wt: mx.array | None = None, fast: bool | None = None):
-    """Returns the kernel's outputs in the order (out or y, [pn]): out float32 [K, Q, D] / y uint16 [K, Q, D], pn [K, D]."""
+def mix2(sources: list, queries: mx.array, norm_in: bool = False, pout: bool = False, wt: mx.array | None = None, fast: bool | None = None,
+         zc: bool = False):
+    """Returns the kernel's outputs in the order (out or y, [pn]): out float32 [K, Q, D] / y uint16 [K, Q, D], pn [K, D].
+    zc: also a zeroed uint32 [1] (route()'s counter), last."""
     N, Q, K = len(sources), queries.shape[0], sources[0].shape[0]
     fast = MIXF if fast is None else fast
-    key = (N, Q, norm_in, pout, wt is not None, fast)
-    k = _mix2.get(key) or _mix2.setdefault(key, (_make_mix2f if fast else _make_mix2)(*key[:5]))
+    if zc:
+        fast = False
+    key = (N, Q, norm_in, pout, wt is not None, fast, zc)
+    k = _mix2.get(key) or _mix2.setdefault(key, _make_mix2(*key[:5], zc=True) if zc else (_make_mix2f if fast else _make_mix2)(*key[:5]))
     shapes, dts = [], []
     if wt is None:
         shapes.append((K, Q, 2304)); dts.append(mx.float32)
@@ -1280,10 +1291,12 @@ def mix2(sources: list, queries: mx.array, norm_in: bool = False, pout: bool = F
         shapes.append((K, 2304)); dts.append(mx.float32)
     if wt is not None:
         shapes.append((K, Q, 2304)); dts.append(mx.uint16)
+    if zc:
+        shapes.append((16,)); dts.append(mx.uint32)
     o = k(inputs=list(sources) + [queries] + ([wt] if wt is not None else []), grid=(K * 576, 1, 1), threadgroup=(576, 1, 1),
           output_shapes=shapes, output_dtypes=dts)
     if wt is not None and pout:
-        return o[1], o[0]
+        return (o[1], o[0]) + ((o[2],) if zc else ())
     return o if len(o) > 1 else o[0]
 
 
@@ -1310,7 +1323,7 @@ def _make_gate_pre(G: int, QH: int, M0: int):
                                 source=src, header=_TGHDR)
 
 
-def _make_gate_post(G: int, QH: int, M0: int):
+def _make_gate_post(G: int, QH: int, M0: int, zc: bool = False):
     """y_g = half(rms_norm((1 - tanh(f_g)) h_g + tanh(gain_g) m_g) * wt_g); fg_g float32 [K, 4608] = forget | gain."""
     sel = "".join(f"    if (g == {i}) fg = fg{i};\n" for i in range(1, G))
     src = f"""
@@ -1332,14 +1345,16 @@ def _make_gate_post(G: int, QH: int, M0: int):
     half4 o = half4(v * metal::precise::rsqrt(vv * (1.0f / 2304.0f) + 1e-6f) * *((const device float4*)(wt + g * 2304 + d4)));
 """ + "".join(f"""
     if (g == {i}) *((device half4*)(y{i} + row * 2304 + d4)) = o;""" for i in range(G))
-    return mx.fast.metal_kernel(name=f"mk_gate_post_{G}_{QH}_{M0}", input_names=["h", "msgs", "wt"] + [f"fg{i}" for i in range(G)],
-                                output_names=[f"y{i}" for i in range(G)], source=src, header=_TGHDR)
+    if zc:
+        src += "\n    if (grp == 0 && tid == 0) zc[0] = 0u;\n"
+    return mx.fast.metal_kernel(name=f"mk_gate_post_{G}_{QH}_{M0}{'z' if zc else ''}", input_names=["h", "msgs", "wt"] + [f"fg{i}" for i in range(G)],
+                                output_names=[f"y{i}" for i in range(G)] + (["zc"] if zc else []), source=src, header=_TGHDR)
 
 
 _gpre, _gpost = {}, {}
 
 
-def gates(h, msgs, downs: list, fgs: list, wt, m0: int) -> list:
+def gates(h, msgs, downs: list, fgs: list, wt, m0: int, zc: bool = False) -> list:
     """h float32 [K, QH, D] (QH = 1: the same state for every gate); msgs float32 [K, 4, D]; downs: G down_proj matrices
     (bf16 bits [64, 4608]); fgs: G float32 [4608, 64] (forget | gain); wt float32 [G, D] norm weights -> G arrays uint16
     [K, D]: the gated, normalized states as half bits."""
@@ -1347,12 +1362,12 @@ def gates(h, msgs, downs: list, fgs: list, wt, m0: int) -> list:
     G = len(downs)
     key = (G, QH, m0)
     kp = _gpre.get(key) or _gpre.setdefault(key, _make_gate_pre(*key))
-    kq = _gpost.get(key) or _gpost.setdefault(key, _make_gate_post(*key))
+    kq = _gpost.get(key + (zc,)) or _gpost.setdefault(key + (zc,), _make_gate_post(*key, zc=zc))
     st = kp(inputs=[h, msgs], grid=(K * G * 576, 1, 1), threadgroup=(576, 1, 1), output_shapes=[(K, 4608)] * G,
             output_dtypes=[mx.uint16] * G)
     fg = [gemv_small(fgs[i], gemv(downs[i], st[i])) for i in range(G)]
-    return kq(inputs=[h, msgs, wt] + fg, grid=(K * G * 576, 1, 1), threadgroup=(576, 1, 1), output_shapes=[(K, 2304)] * G,
-              output_dtypes=[mx.uint16] * G)
+    return kq(inputs=[h, msgs, wt] + fg, grid=(K * G * 576, 1, 1), threadgroup=(576, 1, 1), output_shapes=[(K, 2304)] * G + [(16,)] * zc,
+              output_dtypes=[mx.uint16] * G + [mx.uint32] * zc)
 
 
 # static short convolution + residual (+ block residual) and the conv window for the next pass, one kernel
@@ -2400,3 +2415,194 @@ def gates_m(h, msgs, down_s, fg_s, wt, m0: int) -> list:
                   threadgroup=(32, 1, 1), output_shapes=[(K, G * 4608)], output_dtypes=[mx.float32])[0]
     return kq(inputs=[h, msgs, wt, fg], grid=(K * G * 576, 1, 1), threadgroup=(576, 1, 1), output_shapes=[(K, 2304)] * G,
               output_dtypes=[mx.uint16] * G)
+
+
+# ------------------------------------------------------------------------------------------------- router, one dispatch
+# The router GEMV, the top-8 choice and the experts' slot plan in one dispatch (three dependent ones before): the GEMV's
+# threadgroups as mk_gemv (one simdgroup per expert logit, the same lane layout and fma order: the same bits); each
+# threadgroup then counts itself done on a device counter, and the last one to finish reads the 128 logits of every row
+# and runs mk_router's statements (one simdgroup per row) and mk_plan's (one thread per expert) on them. The counter is
+# a uint32 [16] (element 0) that the kernel producing the router's input zeroes (an extra output of it: no fill dispatch).
+# Same bits (k2/bench.py: K = 1..16, 2 and 5 passes); in dependent chains of mix2 + router + experts 1.5 us faster per
+# visit at one row (kmicro.py). Off until a pass measures faster on a quiet GPU (the full-pass timings of this change
+# were taken on a GPU saturated by other processes and were within noise). The counter's device-scope fences are cheap
+# with 16 threadgroups; folding mk_comb into the down kernel the same way (a fence in each of ~1000 threadgroups) was
+# 18 us slower per visit and is not kept.
+ROUTE1 = _osw2.environ.get("MK_ROUTE1", "0") == "1"
+_ROUTE = f"""
+    uint n = thread_position_in_grid.x / 32;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint tid = thread_position_in_threadgroup.x;
+    {{
+        float4 acc[K];
+        for (int k = 0; k < K; k++) acc[k] = float4(0.0f);
+        const device ushort* wr = w + size_t(n) * D;
+        for (int i = 0; i < D / 128; i++) {{
+            int idx = (i * 32 + lane) * 4;
+            float4 wf = {bf4('wr + idx')};
+            for (int k = 0; k < K; k++) {{
+                float4 xv = {hf4('x + k * D + idx')};
+                acc[k] = fma(wf, xv, acc[k]);
+            }}
+        }}
+        for (int k = 0; k < K; k++) {{
+            float4 a = acc[k];
+            float s = simd_sum((a.x + a.y) + (a.z + a.w));
+            if (lane == 0) lg[k * 128 + n] = s;
+        }}
+    }}
+    threadgroup uint last;
+    threadgroup uint tidx[K * 8];
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0) {{
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        last = atomic_fetch_add_explicit((device atomic_uint*)zc, 1u, memory_order_relaxed) == NTG - 1;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (last == 0) return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    for (uint row = sg; row < K; row += NSG) {{
+        const volatile device float* logits = lg;
+        float sc[4];
+        float bi[4];
+        for (int i = 0; i < 4; i++) {{
+            uint e = lane + 32 * i;
+            float x = logits[row * 128 + e];
+            float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(x)));
+            sc[i] = x < 0 ? y : 1.0f - y;
+            bi[i] = sc[i] + bias[e];
+        }}
+        float wsel[8];
+        uint esel[8];
+        for (int k = 0; k < 8; k++) {{
+            float best = -INFINITY;
+            uint be = 128;
+            for (int i = 0; i < 4; i++) {{
+                if (bi[i] > best) {{ best = bi[i]; be = lane + 32 * i; }}
+            }}
+            float top = simd_max(best);
+            uint win = simd_min(best == top ? be : 128u);
+            float s = 0.0f;
+            for (int i = 0; i < 4; i++) {{
+                if (lane + 32 * i == win) {{ s = sc[i]; bi[i] = -INFINITY; }}
+            }}
+            wsel[k] = simd_sum(s);
+            esel[k] = win;
+        }}
+        float total = 0.0f;
+        for (int k = 0; k < 8; k++) total += wsel[k];
+        if (lane == 0) {{
+            for (int k = 0; k < 8; k++) {{
+                idx[row * 8 + k] = esel[k];
+                tidx[row * 8 + k] = esel[k];
+                wts[row * 8 + k] = wsel[k] / (total + 1e-20f) * 8.0f;
+            }}
+        }}
+    }}
+    if (PLAN == 0) return;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup uint cnt[128];
+    uint e = tid;
+    uint pairs[K];
+    uint m = 0;
+    uint ns = 0;
+    if (e < 128) {{
+        for (uint p = 0; p < K * 8; p += 4) {{
+            vec<uint, 4> v = *((threadgroup packed_uint4*)(tidx + p));
+            if (v.x == e && m < K) {{ pairs[m] = p; m++; }}
+            if (v.y == e && m < K) {{ pairs[m] = p + 1; m++; }}
+            if (v.z == e && m < K) {{ pairs[m] = p + 2; m++; }}
+            if (v.w == e && m < K) {{ pairs[m] = p + 3; m++; }}
+        }}
+        ns = (m + M - 1) / M;
+        cnt[e] = ns;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (e >= 128) return;
+    vec<uint, 4> offv = vec<uint, 4>(0u), totv = vec<uint, 4>(0u);
+    for (uint i = 0; i < 128; i += 4) {{
+        vec<uint, 4> c4 = *((threadgroup packed_uint4*)(cnt + i));
+        totv += c4;
+        offv += select(vec<uint, 4>(0u), c4, (vec<uint, 4>(i) + vec<uint, 4>(0u, 1u, 2u, 3u)) < vec<uint, 4>(e));
+    }}
+    uint off = offv.x + offv.y + offv.z + offv.w, total = totv.x + totv.y + totv.z + totv.w;
+    for (uint s = 0; s < ns; s++) {{
+        slot_e[off + s] = e;
+        for (uint i = 0; i < M; i++) slot_p[(off + s) * M + i] = (s * M + i < m) ? pairs[s * M + i] : 0xFFFFFFFFu;
+    }}
+    for (uint s = total + e; s < S; s += 128) {{
+        slot_e[s] = 0xFFFFFFFFu;
+        for (uint i = 0; i < M; i++) slot_p[s * M + i] = 0xFFFFFFFFu;
+    }}
+"""
+_route = mx.fast.metal_kernel(name="mk_route", input_names=["w", "x", "bias", "zc"], output_names=["lg", "idx", "wts", "slot_e", "slot_p"],
+                              source=_wi(_ROUTE))
+
+
+def route(w16, x16, bias, zc, M: int = 0):
+    """router(gemv(w16, x16), bias) in one dispatch; zc uint32 [16] (zc[0] zero; 16 elements so that MLX binds it as a
+    device buffer). M > 0: also experts2's slot plan for slots of M pairs (experts2(plan=...)). -> (idx, wts, slot_e,
+    slot_p) (the last two None without M)."""
+    K, D = x16.shape
+    S = min(8 * K, 128)
+    TG = 256
+    o = _route(inputs=[w16, x16, bias, zc], template=[("D", D), ("K", K), ("NTG", 128 * 32 // TG), ("NSG", TG // 32), ("PLAN", int(M > 0)),
+                                                       ("M", max(M, 1)), ("S", S)],
+               grid=(128 * 32, 1, 1), threadgroup=(TG, 1, 1), output_shapes=[(K, 128), (K, 8), (K, 8), (S,), (S, max(M, 1))],
+               output_dtypes=[mx.float32, mx.uint32, mx.float32, mx.uint32, mx.uint32])
+    return o[1], o[2], (o[3] if M else None), (o[4] if M else None)
+
+
+# ------------------------------------------------------------------------------------------------- messages of a pass, one dispatch
+# The cross-pass messages of a loop pass: J looped layers, each the depth mix of the same sources under its own Q = 4
+# queries. mix2's statements (one threadgroup per (row, layer), the same per-row sums), all J layers in one dispatch.
+# Same bits; 12 message mixes in one dispatch: ~50 us less per loop pass at one row in a dependent microbenchmark
+# (kmicro.py: 115 -> 62 us); off until a pass measures faster on a quiet GPU (see ROUTE1).
+MSGM = _osw2.environ.get("MK_MSGM", "0") == "1"
+_mixj = {}
+
+
+def mix_all(sources: list, queries: mx.array) -> mx.array:
+    """sources: N arrays float32 [K, D]; queries float32 [J, Q, D] -> float32 [J, K, Q, D]; [j] = mix2(sources, queries[j])."""
+    N, K = len(sources), sources[0].shape[0]
+    J, Q = queries.shape[0], queries.shape[1]
+    key = (N, Q)
+    k = _mixj.get(key)
+    if k is None:           # _make_mix2(N, Q, False, False, False) with the layer from the threadgroup index
+        names = [f"b{i}" for i in range(N)]
+        load = "\n".join(f"    float4 v{i} = *((const device float4*)({n} + row * 2304 + d4));" for i, n in enumerate(names))
+        dots = "\n".join(f"    tgput(dot4(v{i}, *((const device float4*)(qs + {j} * 2304 + d4))), buf + {(i * Q + j) * 18}, lane, sg);"
+                         for i in range(N) for j in range(Q))
+        dots += "\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        dots += "\n".join(f"    float s{i}_{j} = tgget(buf + {(i * Q + j) * 18});" for i in range(N) for j in range(Q))
+        outs = ""
+        for j in range(Q):
+            outs += f"    {{ float m = s0_{j};\n"
+            for i in range(1, N):
+                outs += f"      m = max(m, s{i}_{j});\n"
+            for i in range(N):
+                outs += f"      float e{i} = metal::precise::exp((s{i}_{j} - m) * SCALE);\n"
+            outs += "      float z = e0" + "".join(f" + e{i}" for i in range(1, N)) + ";\n"
+            outs += "      float4 o = v0 * (e0 / z);\n"
+            for i in range(1, N):
+                outs += f"      o = fma(v{i}, float4(e{i} / z), o);\n"
+            outs += f"      *((device float4*)(out + ((jq * KR + row) * {Q} + {j}) * 2304 + d4)) = o; }}\n"
+        src = f"""
+    constexpr float SCALE = 0.020833333333333332f;      // 2304 ^ -0.5
+    uint row = threadgroup_position_in_grid.x % KR;
+    uint jq = threadgroup_position_in_grid.x / KR;
+    const device float* qs = qa + jq * {Q * 2304};
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint d4 = tid * 4;
+    threadgroup float buf[{N * Q * 18}];
+{load}
+{dots}
+{outs}
+"""
+        k = _mixj[key] = mx.fast.metal_kernel(name=f"mk_mixj_{N}_{Q}", input_names=names + ["qa"], output_names=["out"], source=src,
+                                              header=_TGHDR2)
+    return k(inputs=list(sources) + [queries], template=[("KR", K)], grid=(J * K * 576, 1, 1), threadgroup=(576, 1, 1),
+             output_shapes=[(J, K, Q, 2304)], output_dtypes=[mx.float32])[0]
