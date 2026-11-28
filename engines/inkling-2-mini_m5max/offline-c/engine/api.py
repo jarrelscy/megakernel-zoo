@@ -20,10 +20,19 @@ SPEC = os.environ.get("MK_SPEC", "1") != "0"
 # prompts in wide passes of up to PF_CHUNK rows (mk_target.PREFILL: exact by default, the bits of one-row steps; fast:
 # MLX GEMMs and fused attention, what mkserve serves); a pass is padded to the next of PF_BUCKETS rows, so only those
 # shapes are ever compiled (all of them in _warm)
-PF_CHUNK = int(os.environ.get("MK_PF_CHUNK", "256"))
+# A wider pass reads every expert's weights once for more rows (a 256-row pass is mostly bound by those reads), so a prompt
+# tail of 300-800 tokens goes in one pass where it fits: at a 14K-position context with a 4 GB buffer cache 575 tokens
+# take 350 ms in one 640-row pass against 380 ms in 256 + 256 + 64 rows. The limit is MLX's buffer cache: a global
+# layer's attention mask is [24, K, positions] float32 (900 MB at 640 rows and 14K positions), and a temporary larger
+# than the cache is allocated fresh every time (c1024 at 1 GB: 410 ms). So a pass takes at most PF_CHUNK rows, and only
+# as many as keep that mask within MK_PF_MASK_FRAC of the cache limit (never fewer than 256)
+# (exact prefill keeps 256-row passes: its kernels were not measured wider)
+_FAST = mk_target.PREFILL == "fast"
+PF_CHUNK = int(os.environ.get("MK_PF_CHUNK", "1024" if _FAST else "256"))
+PF_MASK_FRAC = float(os.environ.get("MK_PF_MASK_FRAC", "0.6"))
 # MK_PF_BUCKETS: the padded pass sizes. 32 rows measured slower than 64 at a 14K-position context (149 vs 102 ms), so
 # a short prompt tail pads to 64 by default
-PF_BUCKETS = [k for k in (int(v) for v in os.environ.get("MK_PF_BUCKETS", "64,128,256,512").split(",")) if k <= PF_CHUNK]
+PF_BUCKETS = [k for k in (int(v) for v in os.environ.get("MK_PF_BUCKETS", "64,128,256,384,512,640,768,896,1024" if _FAST else "64,128,256,512").split(",")) if k <= PF_CHUNK]
 # MK_PF_MIN: a remainder of at most this many tokens goes through the step's kernels (8 rows a pass) instead of a padded
 # wide pass (at a 14K-position context, 9-16 new tokens: 41-58 ms in steps, 78 ms in a 64-row pass)
 PF_MIN = int(os.environ.get("MK_PF_MIN", "16"))
@@ -39,7 +48,8 @@ class Engine:
         mx.set_wired_limit(info["max_recommended_working_set_size"])
         # MLX keeps freed buffers for reuse. The temporary arrays of a long prefill (masks of a wide pass over 90,000 keys
         # are gigabytes each) would otherwise stay held: 102 GB in all after a 91,000-token prompt at 131,072 context.
-        mx.set_cache_limit(int(float(os.environ.get("MK_CACHE_GB", "4")) * 2**30))
+        self.cache_bytes = int(float(os.environ.get("MK_CACHE_GB", "4")) * 2**30)
+        mx.set_cache_limit(self.cache_bytes)
         self.tg = Target(model_dir, self.max_context)
         self.vocab = self.tg.vocab
         self.draft = None
@@ -243,6 +253,14 @@ class Engine:
             raise ValueError(f"request {rid!r}: token id out of range")
         self.pending.append((rid, prompt, n, self._sampling(sampling)))
 
+    def _pf_chunk(self) -> int:
+        """The most rows the next wide pass takes (see PF_CHUNK)."""
+        if PF_MASK_FRAC <= 0 or not _FAST:
+            return PF_CHUNK
+        budget, p = PF_MASK_FRAC * self.cache_bytes, self.tg.pos
+        fits = [k for k in PF_BUCKETS if k <= PF_CHUNK and 96 * k * (p + k + 1) <= budget]
+        return max(fits + [min(256, PF_CHUNK)])
+
     def _prefill(self, prompt, embeds=None):
         """The prompt in wide passes of up to PF_CHUNK rows (the last few tokens, if at most PF_MIN remain, in passes of
         the step's kernels); returns the first new token (lazy). embeds = [(start, rows), ...] relative to this prompt,
@@ -251,7 +269,7 @@ class Engine:
         i, last = 0, None
         first_at = embeds[0][0] if embeds else None
         while mk_target.PREFILL != "off" and (len(prompt) - i > PF_MIN or (embeds and i < len(prompt))):
-            n = min(PF_CHUNK, len(prompt) - i)
+            n = min(self._pf_chunk(), len(prompt) - i)
             if first_at is not None and i < first_at < i + n:
                 n = first_at - i            # a pass ends where the embeddings start: a snapshot there (below)
             K = next(k for k in PF_BUCKETS if k >= n)

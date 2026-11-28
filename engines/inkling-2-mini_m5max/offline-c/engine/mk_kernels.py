@@ -597,6 +597,27 @@ _ATT_SH1 = """
 """
 _att_sh1 = mx.fast.metal_kernel(name="mk_attention_shared1", input_names=["q", "kc", "vc", "krec", "vrec", "knew", "vnew", "rel", "proj", "meta", "app"],
                                 output_names=["pm", "pl", "pacc"], source=_ATT_SH1)
+# MK_ATT_SPLIT: the shared attention's loop over rounds of RB = 4 rows written as two loops whose rounds have a
+# compile-time row count (the full rounds of 4, then one round of the K % 4 left) instead of nr = min(4, K - rb). At
+# 14K keys: 5 .. 11 and 13 .. 15 rows took 670 .. 1860 us (8 rows 980) against 300 .. 760 us (8 rows 435) this way;
+# 1 .. 4, 12 and 16 rows the same as before. The same statements per row: the same bits (k3 tests, K = 1 .. 16)
+ATT_SPLIT = _os3.environ.get("MK_ATT_SPLIT", "1") == "1"
+
+
+def _sh1_split(src: str) -> str:
+    head = "    for (int rb = 0; rb < KR; rb += RB) {\n        int nr = min(RB, KR - rb);\n"
+    assert head in src
+    pre, body = src.split(head)
+    # body: the round's statements up to the loop's closing brace (the last line of the kernel)
+    body = body.rstrip()
+    assert body.endswith("}")
+    body = body[:-1]
+    return (pre + "    for (int rb = 0; rb + RB <= KR; rb += RB) {\n        constexpr int nr = RB;\n" + body + "}\n"
+            + "    for (int rb = KR - KR % RB; rb < KR; rb += RB) {\n        constexpr int nr = KR % RB;\n" + body + "}\n")
+
+
+_att_sh1f = mx.fast.metal_kernel(name="mk_attention_shared1f", input_names=["q", "kc", "vc", "krec", "vrec", "knew", "vnew", "rel", "proj", "meta", "app"],
+                                 output_names=["pm", "pl", "pacc"], source=_sh1_split(_ATT_SH1))
 _ATT_SH2 = """
     uint grp = threadgroup_position_in_grid.x;
     uint d4 = thread_position_in_threadgroup.x * 4;
@@ -629,11 +650,18 @@ def attention_shared(q, kc, vc, krec, vrec, knew, vnew, rel, proj, sinks, meta, 
     K = q.shape[0]
     nch = (1024 + K + 2 * ATT_CH - 2) // ATT_CH if local else (smax + ATT_CH - 1) // ATT_CH
     projt = proj.shape[0] == 1024
-    pm, pl, pacc = _att_sh1(inputs=[q, kc, vc, krec, vrec, knew, vnew, rel, proj, meta, app],
-                            template=[("CH", ATT_CH), ("NCH", nch), ("KR", K), ("TT", kc.shape[1]), ("RR", krec.shape[1]), ("PROJT", projt)],
-                            grid=(nch * 8 * 256, 1, 1), threadgroup=(256, 1, 1),
-                            output_shapes=[(K * 24 * nch,), (K * 24 * nch,), (K * 24 * nch, 128)],
-                            output_dtypes=[mx.float32, mx.float32, mx.float32])
+    if ATT_SPLIT:
+        pm, pl, pacc = _att_sh1f(inputs=[q, kc, vc, krec, vrec, knew, vnew, rel, proj, meta, app],
+                                 template=[("CH", ATT_CH), ("NCH", nch), ("KR", K), ("TT", kc.shape[1]), ("RR", krec.shape[1]), ("PROJT", projt)],
+                                 grid=(nch * 8 * 256, 1, 1), threadgroup=(256, 1, 1),
+                                 output_shapes=[(K * 24 * nch,), (K * 24 * nch,), (K * 24 * nch, 128)],
+                                 output_dtypes=[mx.float32, mx.float32, mx.float32])
+    else:
+        pm, pl, pacc = _att_sh1(inputs=[q, kc, vc, krec, vrec, knew, vnew, rel, proj, meta, app],
+                                template=[("CH", ATT_CH), ("NCH", nch), ("KR", K), ("TT", kc.shape[1]), ("RR", krec.shape[1]), ("PROJT", projt)],
+                                grid=(nch * 8 * 256, 1, 1), threadgroup=(256, 1, 1),
+                                output_shapes=[(K * 24 * nch,), (K * 24 * nch,), (K * 24 * nch, 128)],
+                                output_dtypes=[mx.float32, mx.float32, mx.float32])
     return _att_sh2(inputs=[pm, pl, pacc, sinks, gate, meta], template=[("CH", ATT_CH), ("NCH", nch)], grid=(K * 24 * 32, 1, 1),
                     threadgroup=(32, 1, 1), output_shapes=[(K, 3072)], output_dtypes=[mx.uint16])[0]
 
@@ -1444,7 +1472,7 @@ def _make_gate_post(G: int, QH: int, M0: int, zc: bool = False):
 _gpre, _gpost = {}, {}
 
 
-def gates(h, msgs, downs: list, fgs: list, wt, m0: int, zc: bool = False) -> list:
+def gates(h, msgs, downs: list, fgs: list, wt, m0: int, zc: bool = False, mm: bool = False) -> list:
     """h float32 [K, QH, D] (QH = 1: the same state for every gate); msgs float32 [K, 4, D]; downs: G down_proj matrices
     (bf16 bits [64, 4608]); fgs: G float32 [4608, 64] (forget | gain); wt float32 [G, D] norm weights -> G arrays uint16
     [K, D]: the gated, normalized states as half bits."""
@@ -1455,7 +1483,11 @@ def gates(h, msgs, downs: list, fgs: list, wt, m0: int, zc: bool = False) -> lis
     kq = _gpost.get(key + (zc,)) or _gpost.setdefault(key + (zc,), _make_gate_post(*key, zc=zc))
     st = kp(inputs=[h, msgs], grid=(K * G * 576, 1, 1), threadgroup=(576, 1, 1), output_shapes=[(K, 4608)] * G,
             output_dtypes=[mx.uint16] * G)
-    fg = [gemv_small(fgs[i], gemv(downs[i], st[i])) for i in range(G)]
+    if mm:          # a fast wide pass: the two projections as MLX GEMMs (half, then float32); not the kernels' bits
+        fg = [mx.matmul(mx.matmul(st[i].view(mx.float16), downs[i].view(mx.bfloat16).astype(mx.float16).T).astype(mx.float32),
+                        fgs[i].T) for i in range(G)]
+    else:
+        fg = [gemv_small(fgs[i], gemv(downs[i], st[i])) for i in range(G)]
     return kq(inputs=[h, msgs, wt] + fg, grid=(K * G * 576, 1, 1), threadgroup=(576, 1, 1), output_shapes=[(K, 2304)] * G + [(16,)] * zc,
               output_dtypes=[mx.uint16] * G + [mx.uint32] * zc)
 
@@ -2328,6 +2360,18 @@ def experts_mm(fmt: str, w13, s13, g13, w2, s2, g2, x16, idx, wts) -> mx.array:
 EXP_XS = int(_osw2.environ.get("MK_EXP_XS", "8"))
 EXP_F32 = _osw2.environ.get("MK_EXP_F32", "0") == "1"
 EXP_STATS = None
+# MK_EXP_COMPILE: experts_mm under mx.compile (its element-wise steps fused: the same bits, -13% at 256 rows)
+EXP_COMPILE = _osw2.environ.get("MK_EXP_COMPILE", "1") == "1"
+_emm_c = {}
+
+
+def experts_mm_c(fmt: str, *args) -> mx.array:
+    if not EXP_COMPILE or EXP_STATS is not None:
+        return experts_mm(fmt, *args)
+    f = _emm_c.get(fmt)
+    if f is None:
+        f = _emm_c[fmt] = mx.compile(lambda *a: experts_mm(fmt, *a))
+    return f(*args)
 
 
 # ------------------------------------------------------------------------------------------------- sampling
@@ -2696,3 +2740,36 @@ def mix_all(sources: list, queries: mx.array) -> mx.array:
                                               header=_TGHDR2)
     return k(inputs=list(sources) + [queries], template=[("KR", K)], grid=(J * K * 576, 1, 1), threadgroup=(576, 1, 1),
              output_shapes=[(J, K, Q, 2304)], output_dtypes=[mx.float32])[0]
+
+
+# ------------------------------------------------------------------------------------------------- wide attention mask
+# The additive mask of a fast wide pass's fused attention (mk_target._attn_wide) in one kernel instead of ~10 array
+# operations over [24, K, S] (index, clip, gather, two selects, concatenation): column j < far 0 (keys further than 1,023
+# from every row of a global layer), the relative bias of distance d = p0 + r - lo - j below 1,024, -inf where the key is
+# not visible (d < 0, or d >= 1,024 in a local window), 0 for a visible global key further away; the last column is the
+# row's sink logit. The same values as the array operations (a copy of relb's entries or a constant).
+_WMASK = """
+    uint j = thread_position_in_grid.x;
+    uint hr = thread_position_in_grid.y;
+    int p0 = meta[0], lo = meta[1], far = meta[2], S = meta[3], loc = meta[4];
+    if (int(j) > S) return;
+    uint h = hr / KR, r = hr % KR;
+    float v;
+    if (int(j) == S) v = sinks[r * 24 + h];
+    else if (int(j) < far) v = 0.0f;
+    else {
+        int d = p0 + int(r) - lo - int(j);
+        if (d < 0 || (loc != 0 && d >= 1024)) v = -INFINITY;
+        else v = d < 1024 ? relb[size_t(hr) * 1024 + d] : 0.0f;
+    }
+    out[size_t(hr) * (S + 1) + j] = T(v);
+"""
+_wmask = mx.fast.metal_kernel(name="mk_wmask", input_names=["relb", "sinks", "meta"], output_names=["out"], source=_WMASK)
+
+
+def wide_mask(relb, sinks, p0: int, lo: int, far: int, S: int, local: bool, dtype=mx.float32):
+    """relb float32 [24, K, 1024] (bias by distance), sinks float32 [K, 24] -> mask [24, K, S + 1] (see above)."""
+    K = relb.shape[1]
+    meta = mx.array([p0, lo, far, S, int(local)], dtype=mx.int32)
+    return _wmask(inputs=[relb, sinks, meta], template=[("KR", K), ("T", dtype)], grid=(-(-(S + 1) // 256) * 256, 24 * K, 1),
+                  threadgroup=(256, 1, 1), output_shapes=[(24, K, S + 1)], output_dtypes=[dtype])[0]

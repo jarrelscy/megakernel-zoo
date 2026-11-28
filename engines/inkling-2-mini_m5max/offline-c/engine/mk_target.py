@@ -49,6 +49,13 @@ WHATIF_NO = os.environ.get("MK_WHATIF_NO", "")     # timing experiment only: "de
 PREFILL = os.environ.get("MK_PREFILL", "exact")
 PF_M = int(os.environ.get("MK_PF_M", "8"))
 WIDE_MIN = 17
+# MK_WMASK: the additive mask of a fast wide pass's attention built by one kernel (kn.wide_mask; the same values)
+WMASK = os.environ.get("MK_WMASK", "1") == "1"
+# MK_WATT16: that attention on half queries, keys, values and mask (the keys and values are stored as half; MLX's half
+# kernel). Not the bits of the float32 one
+WATT16 = os.environ.get("MK_WATT16", "0") == "1"
+# MK_GATE_MM: in a fast wide pass, the message gates' two small projections as MLX GEMMs instead of GEMV kernels
+GATE_MM = os.environ.get("MK_GATE_MM", "1") == "1"
 # prefix cache: the K/V arrays are by position, so a later request that starts with the same tokens can keep them; the
 # conv windows (the last 3 inputs of every conv) are the only state that is not, so they are kept for every SNAP-th
 # position (3.8 MB each) and a sequence can be cut back to any of those (rollback()). 0: no snapshots
@@ -506,6 +513,7 @@ class Target:
         """hidden float32 [K, D] (or a pending conv, _Conv); blocks: list of unit-RMS float32 [K, D]; msgs float32
         [K, 4, D] or None. lazy: the output may be returned as a pending conv (the caller consumes it with mix_c / val)."""
         app, kc_a, vc_a, kr_a, vr_a, cw, a_int = st
+        wmm = GATE_MM and K >= WIDE_MIN and PREFILL == "fast"
         wl = [None] * 4
         normed_res = None
         if L["i"] == 0 or GATE3 or not FUSE_CONV:
@@ -541,7 +549,7 @@ class Target:
                 elif GATEM and K <= kn.GEMV_KMAX:
                     hq, hk, hv = kn.gates_m(hm, msgs, L["c_down3s"], L["c_fg3s"], L["anw3"], 0)
                 else:
-                    hq, hk, hv = kn.gates(hm, msgs, L["c_down3"], L["c_fg3"], L["anw3"], 0)
+                    hq, hk, hv = kn.gates(hm, msgs, L["c_down3"], L["c_fg3"], L["anw3"], 0, mm=wmm)
         if DENSE3 and K <= kn.GEMV_KMAX and "qgrs12" in L and not WHATIF_NO:
             o, kk, vv = kn.gemv12_3(L["qgrs12"], L["wk12"], L["wv12"], hq, hk, hv)
         else:
@@ -590,7 +598,7 @@ class Target:
               elif r1:
                   x16, zc = kn.gates(xm, msgs, L["c_down1"], L["c_fg1"], L["mnw"], 3, zc=True)
               else:
-                  x16 = kn.gates(xm, msgs, L["c_down1"], L["c_fg1"], L["mnw"], 3)[0]
+                  x16 = kn.gates(xm, msgs, L["c_down1"], L["c_fg1"], L["mnw"], 3, mm=wmm)[0]
         if r1:          # (MK_ROUTE1 supersedes MK_FUSE_ROUTER: one dispatch for the GEMV, the top-k and the plan)
             idx, wts, se, sp = kn.route(L["router"], x16, L["rbias"], zc, expert_layout(K)[0])
             plan = (se, sp)
@@ -601,7 +609,7 @@ class Target:
         if "experts" in WHATIF_NO:
             y = kn.fill(x16, 2304) * (1.0 + 0.0 * wts[:, :1]) + 0.0 * idx[:, :1].astype(F32)
         elif K >= WIDE_MIN and PREFILL == "fast":
-            y = kn.experts_mm(L["fmt"], L["w13"], L["s13"], L["g13"], L["w2"], L["s2"], L["g2"], x16, idx, wts)
+            y = kn.experts_mm_c(L["fmt"], L["w13"], L["s13"], L["g13"], L["w2"], L["s2"], L["g2"], x16, idx, wts)
         elif K >= WIDE_MIN:
             y = kn.experts2(L["fmt"], L["w13"], L["s13"], L["g13"], L["w2"], L["s2"], L["g2"], x16, idx, wts, PF_M, 1, 4, True)
         else:
@@ -623,13 +631,20 @@ class Target:
         lo = 0 if L["full"] else max(0, p0 - 1023)
         S = p0 - lo + K
         z = mx.zeros((1, 1024), dtype=mx.uint16)
-        keys = mx.concatenate([self.kc[a][0, lo:p0], knew, z]).view(mx.float16).astype(F32)
-        vals = mx.concatenate([self.vc[a][0, lo:p0], vnew, z]).view(mx.float16).astype(F32)
+        adt = mx.float16 if (WATT16 and WMASK) else F32
+        keys = mx.concatenate([self.kc[a][0, lo:p0], knew, z]).view(mx.float16).astype(adt)
+        vals = mx.concatenate([self.vc[a][0, lo:p0], vnew, z]).view(mx.float16).astype(adt)
         keys = keys.reshape(S + 1, 8, 128).transpose(1, 0, 2)[None]
         vals = vals.reshape(S + 1, 8, 128).transpose(1, 0, 2)[None]
         proj = L["proj"] if L["proj"].shape[0] == 16 else L["proj"].T
         relb = mx.matmul(rel.reshape(K, 24, 16).transpose(1, 0, 2), proj)                 # [24, K, 1024] by distance
         far = max(0, S - (1023 + K))        # keys further than 1,023 from every row: no bias, visible to all (global layers)
+        if WMASK:
+            mask = kn.wide_mask(relb, sinks, p0, lo, far, S, not L["full"], adt)[None]
+            o = mx.fast.scaled_dot_product_attention(q.reshape(K, 24, 128).transpose(1, 0, 2)[None].astype(adt), keys, vals,
+                                                     scale=0.08838834764831845, mask=mask)
+            o = o[0].transpose(1, 0, 2).reshape(K, 3072).astype(F32)
+            return (o * mx.sigmoid(gate)).astype(mx.float16).view(mx.uint16)
         d = (p0 + mx.arange(K))[:, None] - (lo + far + mx.arange(S - far))[None, :]         # [K, S - far]
         bias = mx.take_along_axis(relb, mx.broadcast_to(mx.clip(d, 0, 1023)[None], (24, K, S - far)), axis=2)
         bias = mx.where((d < 1024)[None], bias, 0.0)
