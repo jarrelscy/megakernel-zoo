@@ -840,14 +840,39 @@ _comb = mx.fast.metal_kernel(name="mk_comb", input_names=["o", "wts"], output_na
 _up2, _down2 = {}, {}
 
 
+# the router's top-k folded into the plan kernel (one threadgroup of 128 threads: simdgroup j runs the statements of
+# _ROUTER for rows j, j + 4, ..; then the plan reads the idx this threadgroup wrote): one dependent dispatch fewer
+_ROUTE_PLAN = ("""
+    uint lane = thread_index_in_simdgroup;
+    for (uint row = simdgroup_index_in_threadgroup; row < KM; row += 4) {
+""" + _ROUTER.split("uint lane = thread_index_in_simdgroup;\n", 1)[1] + """
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+""" + _PLAN)
+assert "uint row = thread_position_in_grid.x / 32;" in _ROUTER.split("uint lane", 1)[0]
+_route_plan = mx.fast.metal_kernel(name="mk_route_plan", input_names=["logits", "bias"], output_names=["slot_e", "slot_p", "idx", "wts"],
+                                   source=_ROUTE_PLAN)
+
+
+def route_plan(logits, bias, M: int, S: int):
+    """router(logits, bias) and the expert plan of its idx in one kernel -> (slot_e, slot_p, idx, wts)."""
+    K = logits.shape[0]
+    return _route_plan(inputs=[logits, bias], template=[("KM", K), ("NP", 8 * K), ("M", M), ("S", S)], grid=(128, 1, 1),
+                       threadgroup=(128, 1, 1), output_shapes=[(S,), (S, M), (K, 8), (K, 8)],
+                       output_dtypes=[mx.uint32, mx.uint32, mx.uint32, mx.float32])
+
+
 def experts2(fmt: str, w13, s13, g13, w2, s2, g2, x16, idx, wts, M: int, RU: int = 2, RD: int = 2, BR: bool = False,
              plan=None) -> mx.array:
     """As experts(), each distinct expert read once per slot of up to M (row, expert) pairs. plan: (slot_e, slot_p) from
-    route() (the same values mk_plan computes)."""
+    route() (the same values mk_plan computes). idx = None: wts is (router logits, bias), and the router's top-k runs in
+    the plan kernel (route_plan)."""
     K = x16.shape[0]
     S = min(8 * K, 128) if K <= 16 else 128 + 8 * K // M         # wide passes: sum over experts of ceil(pairs / M)
     if plan is not None:
         slot_e, slot_p = plan
+    elif idx is None:
+        slot_e, slot_p, idx, wts = route_plan(wts[0], wts[1], M, S)
     else:
         slot_e, slot_p = _plan(inputs=[idx], template=[("KM", K), ("NP", 8 * K), ("M", M), ("S", S)], grid=(128, 1, 1),
                                threadgroup=(128, 1, 1), output_shapes=[(S,), (S, M)], output_dtypes=[mx.uint32, mx.uint32])
@@ -1157,13 +1182,30 @@ inline float tgget(threadgroup float* buf) {
 """
 
 
-def _make_mix2(N: int, Q: int, norm_in: bool, pout: bool, wout: bool, zc: bool = False):
+def _make_mix2(N: int, Q: int, norm_in: bool, pout: bool, wout: bool, conv: tuple = (), zc: bool = False):
     """Depth mix with the neighbours folded in. Sources b0..b{N-1}; the last one is the partial, RMS-normalized here
     when norm_in. Outputs: out [K, Q, D] float32 (unless wout), pn [K, D] (the normalized partial, when pout),
-    y [K, Q, D] half bits = rms_norm(out_j) * wt[j] (when wout)."""
+    y [K, Q, D] half bits = rms_norm(out_j) * wt[j] (when wout). conv = (add,): the partial is computed here from the
+    static conv (_make_mix2c)."""
     names = [f"b{i}" for i in range(N)]
     L = N - 1
-    load = "\n".join(f"    float4 v{i} = *((const device float4*)({n} + row * 2304 + d4));" for i, n in enumerate(names))
+    load = "\n".join(f"    float4 v{i} = *((const device float4*)({n} + row * 2304 + d4));" for i, n in enumerate(names[:L] if conv else names))
+    if conv:
+        # the statements of _SCONV2 (C = 2304) for this thread's 4 dims of the row
+        load += f"""
+    if (row == 0) for (int r = 0; r < 3; r++) *((device float4*)(win + r * 2304 + d4)) = *((const device float4*)(st + r * 2304 + d4));
+    float4 xv = *((const device float4*)(x + row * 2304 + d4));
+    *((device float4*)(win + (row + 3) * 2304 + d4)) = xv;
+    float4 acc = float4(0.0f);
+    for (int j = 0; j < 4; j++) {{
+        int i = int(row) + j - 3;
+        float4 wv = i < 0 ? *((const device float4*)(st + (3 + i) * 2304 + d4)) : *((const device float4*)(x + i * 2304 + d4));
+        acc = fma(wv, *((const device float4*)(taps + j * 2304 + d4)), acc);
+    }}
+    float4 hc = (acc + xv) * 0.4472135954999579f;
+{"    hc += *((const device float4*)(add + row * 2304 + d4));" if conv[0] else ""}
+    *((device float4*)(hout + row * 2304 + d4)) = hc;
+    float4 v{L} = hc;"""
     nred = N * Q + (1 if norm_in else 0) + (Q if wout else 0)
     pre = ""
     if norm_in:
@@ -1206,9 +1248,15 @@ def _make_mix2(N: int, Q: int, norm_in: bool, pout: bool, wout: bool, zc: bool =
 {dots}
 {outs}
 """
-    onames = ([] if wout else ["out"]) + (["pn"] if pout else []) + (["y"] if wout else []) + (["zc"] if zc else [])
+    onames = ([] if wout else ["out"]) + (["pn"] if pout else []) + (["y"] if wout else [])
     if zc:
         src += "    if (row == 0 && tid == 0) zc[0] = 0u;\n"
+    if conv:
+        cin = ["x", "st", "taps"] + (["add"] if conv[0] else [])
+        return mx.fast.metal_kernel(name=f"mk_mix2c_{N}_{Q}_{int(norm_in)}{int(pout)}{int(wout)}{int(conv[0])}{'z' if zc else ''}",
+                                    input_names=names[:L] + cin + ["qs"] + (["wt"] if wout else []),
+                                    output_names=onames + ["hout", "win"] + (["zc"] if zc else []), source=src, header=_TGHDR2)
+    onames += ["zc"] if zc else []
     return mx.fast.metal_kernel(name=f"mk_mix2_{N}_{Q}_{int(norm_in)}{int(pout)}{int(wout)}{'z' if zc else ''}", input_names=names + ["qs"] + (["wt"] if wout else []),
                                 output_names=onames, source=src, header=_TGHDR2)
 
@@ -1269,6 +1317,14 @@ def _make_mix2f(N: int, Q: int, norm_in: bool, pout: bool, wout: bool):
                                 output_names=onames, source=src, header=_TGHDR2)
 
 
+def _make_mix2c(N: int, Q: int, norm_in: bool, pout: bool, wout: bool, add: bool, zc: bool = False):
+    """_make_mix2 with the static conv that makes its last source folded in (the sconv2 kernel of the visit, which ran
+    just before as its own dispatch): each thread computes its 4 dims of the partial h = (conv(win) + x) / sqrt(5)
+    (+ add) from x, the window st and the taps with the statements of _SCONV2, writes h and its rows of the window
+    [K + 3, D], and goes on with the depth mix of _make_mix2 on h. Same statements on the same operands: same bits."""
+    return _make_mix2(N, Q, norm_in, pout, wout, conv=(add,), zc=zc)
+
+
 _mix2 = {}
 import os as _os5
 MIXF = _os5.environ.get("MK_MIXF", "0") == "1"       # bit-equal and 2x faster alone, no gain in a pass (journal): off
@@ -1298,6 +1354,38 @@ def mix2(sources: list, queries: mx.array, norm_in: bool = False, pout: bool = F
     if wt is not None and pout:
         return (o[1], o[0]) + ((o[2],) if zc else ())
     return o if len(o) > 1 else o[0]
+
+
+_mix2c = {}
+
+
+def mix2c(blocks: list, x, st, taps, add, queries: mx.array, norm_in: bool = False, pout: bool = False, wt: mx.array | None = None,
+          zc: bool = False):
+    """sconv2(x, st, taps, add) -> (h, win) and mix2(blocks + [h], queries, ...) in one kernel.
+    -> (the outputs of mix2 as a list in mix2's return order (with zc: route()'s zeroed counter last), h [K, D],
+    win [K + 3, D])."""
+    N, Q, K = len(blocks) + 1, queries.shape[0], x.shape[0]
+    assert x.shape[1] == 2304
+    key = (N, Q, norm_in, pout, wt is not None, add is not None, zc)
+    k = _mix2c.get(key) or _mix2c.setdefault(key, _make_mix2c(*key))
+    shapes, dts = [], []
+    if wt is None:
+        shapes.append((K, Q, 2304)); dts.append(mx.float32)
+    if pout:
+        shapes.append((K, 2304)); dts.append(mx.float32)
+    if wt is not None:
+        shapes.append((K, Q, 2304)); dts.append(mx.uint16)
+    shapes += [(K, 2304), (K + 3, 2304)]; dts += [mx.float32, mx.float32]
+    if zc:
+        shapes.append((16,)); dts.append(mx.uint32)
+    ins = list(blocks) + [x, st, taps] + ([add] if add is not None else []) + [queries] + ([wt] if wt is not None else [])
+    o = k(inputs=ins, grid=(K * 576, 1, 1), threadgroup=(576, 1, 1), output_shapes=shapes, output_dtypes=dts)
+    z = [o[-1]] if zc else []
+    o = o[:-1] if zc else o
+    main, h, win = list(o[:-2]), o[-2], o[-1]
+    if wt is not None and pout:
+        main = [main[1], main[0]]
+    return main + z, h, win
 
 
 # message gates of the looped layers: G gates at once (q, k, v: G = 3, messages 0..2; mlp: G = 1, message 3)

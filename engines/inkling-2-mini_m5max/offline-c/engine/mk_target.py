@@ -135,6 +135,44 @@ def sample_rows(lg, sp, seed, q0, filt: bool, want_p: bool = False):
 MSG_MIX2 = os.environ.get("MK_MSG_MIX2", "0") == "1"      # bit-equal, and no gain in a pass (not on its critical path)
 
 
+# MK_FUSE_CONV: the static conv + residual (sconv2) that ends the attention and the MLP of a visit is folded into the
+# depth-mix kernel that reads its output (the MLP input mix, and the next visit's attention-input mix or the final
+# mix), computed there per row by the threads that use it: two dependent dispatches fewer per visit, same bits.
+FUSE_CONV = os.environ.get("MK_FUSE_CONV", "1") == "1"
+
+
+# MK_FUSE_ROUTER: the router's top-k runs in the expert plan kernel (kn.route_plan) of the step passes: same bits.
+FUSE_ROUTER = os.environ.get("MK_FUSE_ROUTER", "1") == "1"
+
+
+class _Conv:
+    """A pending static conv: out = sconv2(x, st, taps, add), its window [K + 3, D] goes to slot[j]. Computed by the
+    depth mix that consumes it (mix_c) or on its own (force)."""
+    __slots__ = ("x", "st", "taps", "add", "slot", "j", "out")
+
+    def __init__(self, x, st, taps, add, slot, j):
+        self.x, self.st, self.taps, self.add, self.slot, self.j, self.out = x, st, taps, add, slot, j, None
+
+    def force(self):
+        if self.out is None:
+            self.out, self.slot[self.j] = kn.sconv2(self.x, self.st, self.taps, add=self.add)
+        return self.out
+
+
+def val(h):
+    return h.force() if isinstance(h, _Conv) else h
+
+
+def mix_c(blocks, last, queries, **kw):
+    """kn.mix2(blocks + [last], queries, **kw) where last may be a pending conv (then folded into the mix kernel)."""
+    if isinstance(last, _Conv):
+        if last.out is None and FUSE_CONV:
+            main, last.out, last.slot[last.j] = kn.mix2c(blocks, last.x, last.st, last.taps, last.add, queries, **kw)
+            return main[0] if len(main) == 1 else tuple(main)
+        last = last.force()
+    return kn.mix2(blocks + [last], queries, **kw)
+
+
 def msg_mix(sources, queries):
     """The cross-pass messages of a looped layer: the depth mix of the previous loop's blocks under 4 queries. Through
     the mix2 kernel (all its dot products behind one barrier: 7 us at one row) instead of the first mix kernel (a
@@ -464,34 +502,38 @@ class Target:
         fg = mx.tanh(kn.gemv_small(L["c" + c + "_fg"], dn))                  # [K, 4608]
         return (1 - fg[:, :2304]) * h + fg[:, 2304:] * m
 
-    def _layer(self, st, L, hidden, blocks, msgs, meta, K, knew_l, vnew_l, wins_l):
-        """hidden float32 [K, D]; blocks: list of unit-RMS float32 [K, D]; msgs float32 [K, 4, D] or None."""
+    def _layer(self, st, L, hidden, blocks, msgs, meta, K, knew_l, vnew_l, wins_l, lazy=False):
+        """hidden float32 [K, D] (or a pending conv, _Conv); blocks: list of unit-RMS float32 [K, D]; msgs float32
+        [K, 4, D] or None. lazy: the output may be returned as a pending conv (the caller consumes it with mix_c / val)."""
         app, kc_a, vc_a, kr_a, vr_a, cw, a_int = st
+        wl = [None] * 4
         normed_res = None
+        if L["i"] == 0 or GATE3 or not FUSE_CONV:
+            hidden = val(hidden)
         if L["i"] == 0:
             normed_res = rms(hidden)
             hq = hk = hv = kn.bits(rms(hidden, L["an"]))
         else:
-            srcs = blocks + [hidden]
             if msgs is None:
                 if L["boundary"]:
-                    y, normed_res = kn.mix2(srcs, L["aq2"], norm_in=True, pout=True, wt=L["anw"])
+                    y, normed_res = mix_c(blocks, hidden, L["aq2"], norm_in=True, pout=True, wt=L["anw"])
                 else:
-                    y = kn.mix2(srcs, L["aq2"], norm_in=True, wt=L["anw"])
+                    y = mix_c(blocks, hidden, L["aq2"], norm_in=True, wt=L["anw"])
                 if L["full"]:
                     hq, hk, hv = y[:, 0], y[:, 1], y[:, 2]
                 else:
                     hq = hk = hv = y[:, 0]
             else:
                 if GATE3:
+                    srcs = blocks + [hidden]
                     hm, pn_, st_ = kn.mix2g(srcs, L["aq2"], msgs, 3, 0, pout=L["boundary"])
                     if L["boundary"]:
                         normed_res = pn_
                     hq, hk, hv = kn.gates3(st_, hm, msgs, L["c_down3"], L["c_fg3"], L["anw3"], 0)
                 elif L["boundary"]:
-                    hm, normed_res = kn.mix2(srcs, L["aq2"], norm_in=True, pout=True)
+                    hm, normed_res = mix_c(blocks, hidden, L["aq2"], norm_in=True, pout=True)
                 else:
-                    hm = kn.mix2(srcs, L["aq2"], norm_in=True)
+                    hm = mix_c(blocks, hidden, L["aq2"], norm_in=True)
                 if GATE3:
                     pass
                 elif GATE2:
@@ -517,39 +559,43 @@ class Target:
         else:
             att16 = kn.attention_gate(q, kc_a, vc_a, kr_a, vr_a, knew, vnew, rel, L["proj"], sinks, meta[0 if L["full"] else 1],
                                       app, gate, self.smax, local=not L["full"])
+        hidden = val(hidden)
+        wl[0], wl[1] = w0, w1
         ao = dense(L, "wo", att16)
         if L["boundary"]:
-            h, w2 = kn.sconv2(ao, cw[2], L["a_conv"])
+            hc = _Conv(ao, cw[2], L["a_conv"], None, wl, 2)
             blocks = blocks + [normed_res]
         else:
-            h, w2 = kn.sconv2(ao, cw[2], L["a_conv"], add=hidden)
-        srcs = blocks + [h]
+            hc = _Conv(ao, cw[2], L["a_conv"], hidden, wl, 2)
         # the router GEMV, top-8 and the experts' slot plan in one dispatch (kernels: route); its counter is zeroed
-        # by the kernel that produces the router's input
+        # by the kernel that produces the router's input (the MLP-input mix, with the conv folded in or not, or the
+        # last gate kernel)
         r1 = kn.ROUTE1 and K < WIDE_MIN and not WHATIF_NO and (msgs is None or not (GATE2 or GATE3))
         zc = plan = None
         if msgs is None:
             if r1:
-                y_, zc = kn.mix2(srcs, L["mq2"], norm_in=True, wt=L["mnw"], zc=True)
+                y_, zc = mix_c(blocks, hc, L["mq2"], norm_in=True, wt=L["mnw"], zc=True)
                 x16 = y_[:, 0]
             else:
-                x16 = kn.mix2(srcs, L["mq2"], norm_in=True, wt=L["mnw"])[:, 0]
+                x16 = mix_c(blocks, hc, L["mq2"], norm_in=True, wt=L["mnw"])[:, 0]
         else:
             if GATE3:
+                srcs = blocks + [hc.force()]
                 xm, _, st_ = kn.mix2g(srcs, L["mq2"], msgs, 1, 3)
                 x16 = kn.gates3(st_, xm, msgs, L["c_down1"], L["c_fg1"], L["mnw"], 3)[0]
             else:
-              xm = kn.mix2(srcs, L["mq2"], norm_in=True)
+              xm = mix_c(blocks, hc, L["mq2"], norm_in=True)
               if GATE2:
                   x16 = kn.gates2(xm, msgs, L["c_down1"], L["c_ft1"], L["mnw"], 3)[0]
               elif r1:
                   x16, zc = kn.gates(xm, msgs, L["c_down1"], L["c_fg1"], L["mnw"], 3, zc=True)
               else:
                   x16 = kn.gates(xm, msgs, L["c_down1"], L["c_fg1"], L["mnw"], 3)[0]
-        if r1:
-            lay = expert_layout(K)
-            idx, wts, se, sp = kn.route(L["router"], x16, L["rbias"], zc, lay[0])
+        if r1:          # (MK_ROUTE1 supersedes MK_FUSE_ROUTER: one dispatch for the GEMV, the top-k and the plan)
+            idx, wts, se, sp = kn.route(L["router"], x16, L["rbias"], zc, expert_layout(K)[0])
             plan = (se, sp)
+        elif FUSE_ROUTER and K < WIDE_MIN and "experts" not in WHATIF_NO:      # the top-k in the experts' plan kernel
+            idx, wts = None, (kn.gemv(L["router"], x16), L["rbias"])
         else:
             idx, wts = kn.router(kn.gemv(L["router"], x16), L["rbias"])
         if "experts" in WHATIF_NO:
@@ -560,10 +606,13 @@ class Target:
             y = kn.experts2(L["fmt"], L["w13"], L["s13"], L["g13"], L["w2"], L["s2"], L["g2"], x16, idx, wts, PF_M, 1, 4, True)
         else:
             y = kn.experts2(L["fmt"], L["w13"], L["s13"], L["g13"], L["w2"], L["s2"], L["g2"], x16, idx, wts, *expert_layout(K), plan=plan)
-        out, w3 = kn.sconv2(y, cw[3], L["m_conv"], add=h)
+        h = hc.force()
+        out = _Conv(y, cw[3], L["m_conv"], h, wl, 3)
+        if not (lazy and FUSE_CONV) or PAD:
+            out = out.force()
         for _ in range(PAD):                     # timing experiment only: dependent trivial dispatches
             out = kn.ident(out)
-        knew_l.append(knew); vnew_l.append(vnew); wins_l.append([w0, w1, w2, w3])
+        knew_l.append(knew); vnew_l.append(vnew); wins_l.append(wl)
         return out, blocks
 
     def _attn_wide(self, L, a: int, q, knew, vnew, rel, sinks, gate):
@@ -617,22 +666,25 @@ class Target:
         v = 0
         for i in range(cs):
             if v in taps: feats.append(h)
-            h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, None, meta, K, knew, vnew, wins); a += 1; v += 1
+            h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, None, meta, K, knew, vnew, wins, lazy=True); a += 1; v += 1
         pre_h, pre_blocks = h, blocks
         for lp in range(passes):
             if lp > 0:
-                bank_blocks, bank_part = blocks[len(pre_blocks) + 1:], rms(h)
+                bank_blocks, bank_part = blocks[len(pre_blocks) + 1:], rms(val(h))
                 h, blocks = pre_h, pre_blocks
             allm = kn.mix_all(bank_blocks + [bank_part], self.msg_query) if lp > 0 and kn.MSGM else None
             for j, i in enumerate(self.core):
                 msgs = (allm[j] if allm is not None else msg_mix(bank_blocks + [bank_part], self.msg_query[j])) if lp > 0 else None
                 if v in taps: feats.append(h)
-                h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, msgs, meta, K, knew, vnew, wins); a += 1; v += 1
+                h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, msgs, meta, K, knew, vnew, wins, lazy=True); a += 1; v += 1
         a = cs + self.passes * len(self.core)
         for i in range(ce, len(self.layers)):
             if v in taps: feats.append(h)
-            h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, None, meta, K, knew, vnew, wins); a += 1; v += 1
-        fo16 = kn.mix2(blocks + [h], self.out_query[None], norm_in=True, wt=self.norm[None])[:, 0]
+            h, blocks = self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[a] for c in cw], a), self.layers[i], h, blocks, None, meta, K, knew, vnew, wins, lazy=True); a += 1; v += 1
+        fo16 = mix_c(blocks, h, self.out_query[None], norm_in=True, wt=self.norm[None])[:, 0]
+        h = val(h)
+        feats = [val(f) for f in feats]      # taps that were pending convs: computed by the mixes that consumed them
+        assert all(w is not None for ws in wins for w in ws)
         if K >= WIDE_MIN:           # wide pass: the caller takes the token of the one row it needs (prefill())
             logits = fo16
         elif tok_only:
@@ -652,7 +704,7 @@ class Target:
     # suffix of rows whose stage A is in hand. Every row goes through the statements of _pure with the same inputs
     # (stage A's results are carried, not recomputed), so A then B gives each row the bits of the one pass.
     def _lay(self, a, ci, i, h, blocks, msgs, meta, K, kc, vc, kr, vr, cw, knew, vnew, wins):
-        return self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[ci] for c in cw], a), self.layers[i], h, blocks, msgs, meta, K, knew, vnew, wins)
+        return self._layer((self.aidx[a], kc[a], vc[a], kr, vr, [c[ci] for c in cw], a), self.layers[i], h, blocks, msgs, meta, K, knew, vnew, wins, lazy=True)
 
     def _stage_a(self, tokens, m_full, m_loc, kc, vc, kr, vr, cwa, samp=None):
         """tokens int32 [K] at positions m_full[0] ..; cwa: the conv windows [24, 3, d] of visits 0 .. 17 and of the 6
@@ -675,12 +727,13 @@ class Target:
             h, blocks = self._lay(cs + j, cs + j, i, h, blocks, None, meta, K, kc, vc, kr, vr, cwa, knew, vnew, wins)
         tail = blocks[len(pre_blocks) + 1:]
         self._nc = (len(pre_blocks), len(tail))
-        carry = mx.stack([pre_h, h, feats[0]] + pre_blocks + tail, axis=1)
+        carry = mx.stack([val(pre_h), val(h), val(feats[0])] + pre_blocks + tail, axis=1)
         a0 = cs + self.passes * n
         for i in range(ce, len(self.layers)):
             if i in tl: feats.append(h)
             h, blocks = self._lay(a0 + i - ce, cs + n + i - ce, i, h, blocks, None, meta, K, kc, vc, kr, vr, cwa, knew, vnew, wins)
-        fo16 = kn.mix2(blocks + [h], self.out_query[None], norm_in=True, wt=self.norm[None])[:, 0]
+        fo16 = mix_c(blocks, h, self.out_query[None], norm_in=True, wt=self.norm[None])[:, 0]
+        feats = [val(f) for f in feats]
         if samp is None:
             tok, pr = self._readout(fo16)
         else:
@@ -709,7 +762,7 @@ class Target:
         for lp in range(1, self.passes):
             if blocks is not None:
                 bank_blocks = blocks[len(pre_blocks) + 1:]
-            bank_part = rms(h)
+            bank_part = rms(val(h))
             h, blocks = pre_h, pre_blocks
             allm = kn.mix_all(bank_blocks + [bank_part], self.msg_query) if kn.MSGM else None
             for j, i in enumerate(self.core):
@@ -719,7 +772,8 @@ class Target:
         for i in range(ce, len(self.layers)):
             if a in self.taps: feats.append(h)
             h, blocks = self._lay(a, a, i, h, blocks, None, meta, K, kc, vc, kr, vr, cw, knew, vnew, wins); a += 1
-        fo16 = kn.mix2(blocks + [h], self.out_query[None], norm_in=True, wt=self.norm[None])[:, 0]
+        fo16 = mix_c(blocks, h, self.out_query[None], norm_in=True, wt=self.norm[None])[:, 0]
+        feats = [val(f) for f in feats]
         if samp is None:
             tok = kn.argmax_short(self.unembed, self.un8, fo16, self.vocab, self.cap)[0].astype(mx.int32)
         else:           # the rows' tokens drawn from their exact logits: the statements of a sampling step
