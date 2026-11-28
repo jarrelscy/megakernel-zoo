@@ -414,7 +414,7 @@ class Engine:
                     and self.tg.pending is None and self.cached[:L] == key_prompt):
                 # a warm-up of a prompt the live sequence holds already (a repeated warm-up): nothing to do. Running it
                 # would cut back to an earlier snapshot and prefill from there in other passes than the turn would
-                self.request_info[rid] = {"cached_tokens": L}
+                self.request_info[rid] = {"cached_tokens": L, "warm_end": L}
                 events.append((rid, [], True))
                 return events
             if TURN_PROF:
@@ -440,8 +440,13 @@ class Engine:
                 prompt, key_prompt, rel = prompt[:end], key_prompt[:end], []
                 if end == keep:
                     self.cached = key_prompt
+                    self.request_info[rid]["warm_end"] = keep
                     events.append((rid, [], True))
                     return events
+            if opt.get("wide"):
+                # where the warm-up stopped (mkserve's mk.warm answer): the prompt the cache now holds, which is short of
+                # the requested prompt when it stopped at an earlier uncached media block
+                self.request_info[rid]["warm_end"] = len(prompt)
             first = self._prefill(prompt[keep:], rel or None, wide=bool(opt.get("wide")))
             # a snapshot at the end of the prompt: a later request that shares the prompt but not the answer resumes here
             self.tg.snaps[self.tg.pos] = list(self.tg.cw)

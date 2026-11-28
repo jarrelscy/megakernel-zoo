@@ -440,7 +440,15 @@ def add_routes(app: web.Application, core) -> None:
                 if (why := core.check(ids[:cut], 1)):
                     return error(why)
                 _c, _r, _k, final = await collect(ids[:cut], 1, None, [], True, parse=False, extra=warm)
-                return web.json_response({"object": "mk.warm", "prompt_tokens": cut, "cached_tokens": final["cached_tokens"]})
+                # held_tokens: the prompt the cache holds now (the engine's warm_end: short of target_tokens when the
+                # warm-up stopped at an earlier media block the cache lacked, as the turn's own passes would); an engine
+                # that does not report it is taken to have read the whole target
+                cached = int(final.get("cached_tokens") or 0)
+                held = final.get("warm_end")
+                held = cut if held is None else int(held)
+                return web.json_response({"object": "mk.warm", "target_tokens": cut, "held_tokens": held,
+                                          "cached_tokens": min(cached, held), "prefilled_tokens": max(0, held - cached),
+                                          "prompt_tokens": held})
             # thinking_budget 0 (mkserve's own field, also in chat_template_kwargs): the answer starts after an empty reasoning
             # block, so the model writes its tool calls or text at once. For simple turns such as filing a dictated phrase.
             budget = int(budget) if budget is not None else None

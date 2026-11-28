@@ -594,7 +594,7 @@ class Core:
             cached = int(self.extra.get(rid, {}).get("cached_tokens", 0))
             st["cached_prompt_tokens_total"] += cached
             yield {"done": True, "finish": finish, "stop_sequence": stop_seq, "prompt_tokens": len(ids), "completion_tokens": len(out), "ids": list(out), "stop_token": stop_token,
-                   "cached_tokens": cached}
+                   "cached_tokens": cached, "warm_end": self.extra.get(rid, {}).get("warm_end")}
         except BaseException:
             st["requests_failed_total"] += 1
             raise
