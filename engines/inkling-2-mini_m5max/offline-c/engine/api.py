@@ -4,6 +4,7 @@ submit() / poll(). step() is the K = 1 pass; a verify pass gives every row the b
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -123,7 +124,7 @@ class Engine:
         back to a snapshot position (need_last: at least the last prompt token is left to run, for its logits). Returns
         the number of prompt tokens kept; the K/V they keep is what a prefill of them would write again in exact mode."""
         tg, keep = self.tg, 0
-        if tg.snaps and self.cached is not None:
+        if tg.snaps and self.cached is not None and not os.environ.get("MK_NO_PREFIX"):     # debug: every prompt prefilled
             m = min(len(self.cached), tg.pos, len(prompt) - (1 if need_last else 0))
             lcp = 0
             while lcp < m and self.cached[lcp] == prompt[lcp]:
@@ -352,7 +353,14 @@ class Engine:
         self.pending = [r for r in self.pending if r[0] != rid]
         self.embeds.pop(rid, None)
         if self.active is not None and self.active["rid"] == rid:
+            self._dump(self.active)
             self.active = None
+
+    @staticmethod
+    def _dump(act) -> None:
+        if os.environ.get("MK_HIST_DUMP"):     # debug: the prompt and answer token ids of each request
+            with open(os.environ["MK_HIST_DUMP"], "a") as fh:
+                fh.write(json.dumps({"plen": act["plen"], "hist": [int(v) for v in act["hist"]], "trace": act.get("trace", [])}) + "\n")
 
     def poll(self):
         events = []
@@ -389,7 +397,8 @@ class Engine:
                                               mx.array([len(prompt)], dtype=mx.int32), samp.filt)[0]
             spec = self.draft is not None and len(prompt) + n + 16 <= self.tg.T
             hist = key_prompt
-            act = self.active = {"rid": rid, "n": n, "sent": 0, "tok": first, "spec": spec, "hist": hist, "samp": samp}
+            act = self.active = {"rid": rid, "n": n, "sent": 0, "tok": first, "spec": spec, "hist": hist, "samp": samp,
+                                 "plen": len(hist)}
             self.cached = act["hist"]           # the prompt and every committed token after it, as the request goes on
             if spec:
                 from mk_draft import Cal
@@ -429,6 +438,7 @@ class Engine:
         done = act["sent"] >= act["n"]
         events.append((act["rid"], toks, done))
         if done:
+            self._dump(act)
             self.active = None
         return events
 
