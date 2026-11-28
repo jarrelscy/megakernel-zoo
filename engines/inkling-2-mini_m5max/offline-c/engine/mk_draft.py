@@ -22,6 +22,17 @@ NARROW = os.environ.get("MK_NARROW", "1") == "1"
 # greedy drafts: the Markov steps score only the base logits' MTOP best tokens of a row (0: the whole vocabulary)
 MTOP = int(os.environ.get("MK_MTOP", "64"))      # 64: 1-3% faster decode, the more() steps 0.76 -> 0.19 ms
 TRACE = bool(os.environ.get("MK_HIST_DUMP"))     # debug: a per-cycle trace (position, kind, rows, accepted, seconds)
+# Copy sources and shapes beyond the request's own tokens (proposals only: the verify pass decides every token).
+# MK_COPY_BANK=N: the outputs of the last N requests are a copy source too. A dictation turn's reasoning repeats the
+# previous turns' reasoning ("We need answer to user turn. Need inspect current report and dictation...", the dictated
+# sentence, the field texts), and the app drops past reasoning from the conversation, so the prompt does not hold it.
+COPY_BANK = int(os.environ.get("MK_COPY_BANK", "32"))
+# MK_COPY_CUT_THINK=1: inside a reasoning block, a copy proposal stops at its first token with a quote or a newline
+# (reasoning quotes a sentence and goes on in its own words: the rows after the quote are mostly rejected)
+COPY_CUT_THINK = os.environ.get("MK_COPY_CUT_THINK", "1") == "1"
+# MK_COPY_QUOTE=1: with no n-gram match, a quote the answer has opened is completed from earlier quoted strings that
+# start with the tokens typed so far (all of them agreeing on 2+ tokens), up to its closing quote
+COPY_QUOTE = os.environ.get("MK_COPY_QUOTE", "1") == "1"
 
 
 def rms(x, w=None, eps=1e-6):
@@ -76,6 +87,54 @@ def ngram_src(hist, min_match: int, max_match: int = 24):
     if best < min_match:
         return None
     return bj + 1, best
+
+
+def quote_prop(h, gen0: int, qend, qany, n: int = NB - 1, need: int = 2, maxm: int = 6):
+    """MK_COPY_QUOTE: inside a quote opened in the generated text (the last token with a quote, within the last 40
+    tokens and at or after gen0, ends with it; 1..maxm tokens typed since), the continuation to the closing quote that
+    the (up to 8 most recent) earlier quoted strings starting with the typed tokens agree on, if 2+ tokens. h: int64
+    array; qend / qany: bool arrays over the vocabulary (token ends with / holds a quote)."""
+    L = len(h)
+    lo = max(gen0, L - 40)
+    q = None
+    for k in range(L - 1, lo - 1, -1):
+        t = int(h[k])
+        if 0 <= t < len(qany) and qany[t]:
+            q = k
+            break
+    if q is None or not qend[int(h[q])]:
+        return None
+    m = L - 1 - q
+    if m < 1 or m > maxm or q - m <= 1:
+        return None
+    c = np.nonzero(h[1:q - m] == h[q + 1])[0] + 1
+    for k in range(1, m):
+        c = c[h[c + k] == h[q + 1 + k]]
+    if c.size:
+        prev = h[c - 1]
+        ok = (prev >= 0) & (prev < len(qend))
+        c = c[ok]
+        c = c[qend[h[c - 1]]] if c.size else c
+    if c.size == 0:
+        return None
+    r = None
+    for x in c[::-1][:8]:
+        out = []
+        j = int(x) + m
+        while j < q and len(out) < n:
+            t = int(h[j])
+            out.append(t)
+            if not (0 <= t < len(qany)) or qany[t]:
+                break
+            j += 1
+        if r is None:
+            r = out
+        else:
+            k = 0
+            while k < len(r) and k < len(out) and r[k] == out[k]:
+                k += 1
+            r = r[:k]
+    return r if r is not None and len(r) >= need else None
 
 
 _BUCK = np.array([0.5, 0.8, 0.95, 0.99])
@@ -221,6 +280,14 @@ class Draft:
         self._fn = None
         self.n1 = int(os.environ.get("MK_DRAFT_N1", "3"))     # Markov steps before the first look at the probabilities
         self.jc_ts = json_copy_tokens(model_dir)
+        self.bank, self.bank_arr = [], np.zeros(0, dtype=np.int64)      # MK_COPY_BANK: recent requests' outputs
+        self.vs = self.jc_ts if self.jc_ts is not None else (json_copy_tokens(model_dir, force=True) if (COPY_CUT_THINK or COPY_QUOTE) else None)
+        if self.vs is not None:
+            self.qany = np.array(['"' in t for t in self.vs], dtype=bool)
+            self.qend = np.array([t.endswith('"') for t in self.vs], dtype=bool)
+            self.qcut = np.array([('"' in t) or ("\n" in t) for t in self.vs], dtype=bool)
+            ids = {t: i for i, t in enumerate(self.vs) if t in ("<|content_thinking|>", "<|end_message|>")}
+            self.id_think, self.id_end = ids.get("<|content_thinking|>", -2), ids.get("<|end_message|>", -2)
         self.review_r = int(os.environ.get("MK_REVIEW", "0"))
         self.review_thr = float(os.environ.get("MK_REVIEW_THR", "0.2"))
         del w
@@ -500,6 +567,52 @@ class Draft:
                 tg.commit(K)
         tg.reset()
 
+    # ---------------------------------------------------------------------------------------------- copy sources
+    def bank_add(self, toks):
+        """MK_COPY_BANK: a finished request's output tokens join the copy bank (the last COPY_BANK of them, each
+        followed by a -1 separator, which ends a copy as a non-token does)."""
+        if COPY_BANK <= 0 or len(toks) < 2:
+            return
+        if not hasattr(self, "bank"):       # Draft2 (mk_draft2) does not run Draft.__init__
+            self.bank = []
+        self.bank.append(np.asarray(toks, dtype=np.int64))
+        del self.bank[:-COPY_BANK]
+        sep = np.full(1, -1, dtype=np.int64)
+        self.bank_arr = np.concatenate([x for b in self.bank for x in (b, sep)])
+
+    def _hb(self, act):
+        """The bank followed by the request's tokens as one int64 array (a per-request buffer filled incrementally:
+        ngram() no longer converts a 15K-token list each cycle)."""
+        hist = act["hist"]
+        bank_arr = getattr(self, "bank_arr", None)
+        if bank_arr is None:
+            bank_arr = self.bank_arr = np.zeros(0, dtype=np.int64)
+        nb = len(bank_arr)
+        buf = act.get("hb")
+        if buf is None or act.get("hb_bank") is not bank_arr or act["hb_n"] > len(hist) or nb + len(hist) > len(buf):
+            buf = np.empty(nb + len(hist) + act.get("n", 0) + 64, dtype=np.int64)
+            buf[:nb] = bank_arr
+            buf[nb:nb + len(hist)] = hist
+            act["hb"], act["hb_bank"], act["hb_n"] = buf, bank_arr, len(hist)
+        k = act["hb_n"]
+        if len(hist) > k:
+            buf[nb + k:nb + len(hist)] = hist[k:]
+            act["hb_n"] = len(hist)
+        return buf[:nb + len(hist)], nb
+
+    def _thinking(self, act) -> bool:
+        """Inside a reasoning block: the last of <|content_thinking|> / <|end_message|> from the prompt's last token on
+        is the opener (tracked incrementally)."""
+        h = act["hist"]
+        st = act.get("th", False)
+        for t in h[act.get("th_k", act["plen"] - 1):]:
+            if t == self.id_think:
+                st = True
+            elif t == self.id_end:
+                st = False
+        act["th"], act["th_k"] = st, len(h)
+        return st
+
     # ---------------------------------------------------------------------------------------------- one cycle
     def cycle(self, eng, act, left: int):
         """One draft-and-verify cycle; returns the committed tokens (1 + the accepted drafts). The draft of a DSpark
@@ -537,8 +650,16 @@ class Draft:
                 jc.lx.dead, cont = True, None
             if cont is None:
                 jc = None
-        if cont is None:
-            cont = ngram(act["hist"], self.ng_min, 15 if wide else nd) if self.ng_min > 0 else None
+        if cont is None and self.ng_min > 0:
+            if COPY_BANK > 0 or COPY_QUOTE:
+                hb, nb = self._hb(act)
+                cont = ngram(hb if COPY_BANK > 0 else hb[nb:], self.ng_min, 15 if wide else nd)
+                if cont is None and COPY_QUOTE and getattr(self, "vs", None) is not None:
+                    cont = quote_prop(hb[nb:], act["plen"], self.qend, self.qany, 15 if wide else nd)
+                    if cont is not None:
+                        cnt["quote_cycles"] = cnt.get("quote_cycles", 0) + 1
+            else:
+                cont = ngram(act["hist"], self.ng_min, 15 if wide else nd)
         if cont is not None:
             # a copy of the prompt can reach an input-embedding position (api.py: a negative stand-in id, e.g. audio):
             # not a token. Cut the proposal there (int32 wraps it into an out-of-range embedding row; mk_draft2 raises)
@@ -550,6 +671,11 @@ class Draft:
                     cont = cont[:ok]
                 else:
                     cont, jc = None, None
+        if cont is not None and jc is None and COPY_CUT_THINK and getattr(self, "vs", None) is not None and self._thinking(act):
+            k = next((i for i, t in enumerate(cont) if int(t) < len(self.qcut) and self.qcut[int(t)]), None)
+            if k is not None and k + 1 < len(cont):
+                cont = cont[:k + 1]
+                cnt["copy_cut_think"] = cnt.get("copy_cut_think", 0) + 1
         dp = act.pop("draft", None)
         nod = act.pop("nodraft", False)
         m_ok = getattr(self, "rounds", 0) > 0 and left >= 3 and act.get("cal") is not None and (samp is None or getattr(self, "rounds_samp", False))
@@ -700,7 +826,7 @@ class Draft:
 # builds copy proposals that know where a copied string ends (its closing quote), what comes after the value (the same
 # keys and punctuation as the last time a value of that key closed), and what the next value likely starts with. Only
 # proposals: the verify pass decides every token. An answer that does not start with { or [ gets none.
-JSON_COPY = os.environ.get("MK_JSON_COPY", "0") == "1"      # off: with it on, 3-pass answers degenerated (11 of 35 lab blocks cut off at max tokens, "!!!!"); MK_JSON_COPY=1 to test
+JSON_COPY = os.environ.get("MK_JSON_COPY", "1") == "1"      # on: exact (40/40 live dictation turns identical) and, restarted after the tool-call marker, faster
 JC_STRUCT = os.environ.get("MK_JC_STRUCT", "1") == "1"       # the keys and punctuation after a value closes
 JC_VALUE = os.environ.get("MK_JC_VALUE", "1") == "1"         # a value from its key's context as soon as it opens
 JC_PFX = int(os.environ.get("MK_JC_PFX", "1"))               # complete a string from its first JC_PFX+ tokens (0: off)
@@ -713,6 +839,13 @@ JC_MID = os.environ.get("MK_JC_MID", "1") == "1"            # verify passes of 9
 JC_CUT = os.environ.get("MK_JC_CUT", "1") == "1"             # a copy stops where its source string ends
 JC_MAX = int(os.environ.get("MK_JC_MAX", "15"))              # drafts of a JSON proposal (rows - 1)
 JC_STRUCT_CAP = 16
+# The JSON starts after a message's content opener, not at the answer's first token: Inkling writes a tool call as
+# <|message_model|>edit<|content_invoke_tool_json|>{...} (the function name is plain text before the opener), a reply as
+# <|message_model|><|content_text|>..., and a structured-output prompt may prefill the opener and the JSON's first
+# characters ('<|content_text|>{"checks": {"'). Without this the lexer died on "edit" / "I'll" / 'patient_exam_mismatch"'
+# and JsonCopy never proposed on 12 of the 13 replay requests (MK_JC_RESTART=0: the old behaviour).
+JC_RESTART = os.environ.get("MK_JC_RESTART", "1") == "1"
+JC_SEED = 64                                                 # prompt tokens searched back for a prefilled opener
 
 
 class _Lex:
@@ -857,9 +990,10 @@ def _tok_ids(ts):
 
 
 
-def json_copy_tokens(model_dir):
-    """Each token id's text, for JsonCopy (MK_JSON_COPY), or None when it is off or the tokenizer is missing."""
-    if not JSON_COPY:
+def json_copy_tokens(model_dir, force: bool = False):
+    """Each token id's text, for JsonCopy (MK_JSON_COPY; force: for the other copy options), or None when it is off
+    or the tokenizer is missing."""
+    if not (JSON_COPY or force):
         return None
     try:
         from tokenizers import Tokenizer
@@ -889,15 +1023,38 @@ class JsonCopy:
         self.cache = {}
         self.stats = {}             # (key, kind) -> [ok, tried]
         self.segs = []
+        self.seeded = False         # JC_RESTART: the prompt's tail searched for a prefilled opener
 
     def s(self, t: int) -> str:
         return self.ts[t] if 0 <= t < len(self.ts) else "\x00"
 
+    def _opener(self, s: str) -> bool:
+        return s.startswith("<|content_") and s.endswith("|>")
+
     def update(self, hist):
-        """Feed the committed tokens hist[self.n:]; learn what follows each close."""
+        """Feed the committed tokens hist[self.n:]; learn what follows each close. With JC_RESTART the lexer starts
+        afresh after each content opener (<|content_invoke_tool_json|>, <|content_text|>, ...), first looking back
+        into the prompt's last JC_SEED tokens for an opener the prompt prefilled."""
+        if JC_RESTART and not self.seeded:
+            self.seeded = True
+            for k in range(self.plen - 1, max(0, self.plen - JC_SEED) - 1, -1):
+                t = int(hist[k])
+                s = self.s(t)
+                if s == "<|end_message|>" or t < 0:
+                    break
+                if self._opener(s):
+                    self.n = k          # fed below: the opener resets the lexer, the prefilled JSON follows
+                    break
         for i in range(self.n, len(hist)):
-            ev = self.lx.feed(self.s(hist[i]), i, hist)
+            s = self.s(hist[i])
+            if JC_RESTART and self._opener(s):
+                self.lx = _Lex()        # a new message body: the learned structure (self.M) and stats are kept
+                self.coll = []
+                continue
+            ev = self.lx.feed(s, i, hist)
             if self.lx.dead:
+                if JC_RESTART:
+                    continue            # dead until the next opener
                 break
             keep = []
             for ctx, st in self.coll:

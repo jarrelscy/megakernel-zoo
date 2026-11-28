@@ -371,8 +371,14 @@ class Engine:
         self.opts.pop(rid, None)
         if self.active is not None and self.active["rid"] == rid:
             self._dump(self.active)
+            self._bank(self.active)
             self.active = None
             self._busy_t = time.perf_counter()
+
+    def _bank(self, act) -> None:
+        """MK_COPY_BANK: a finished (or cancelled) request's output becomes a copy source for the next requests."""
+        if self.draft is not None and hasattr(self.draft, "bank_add"):
+            self.draft.bank_add(act["hist"][act["plen"]:])
 
     @staticmethod
     def _dump(act) -> None:
@@ -457,6 +463,8 @@ class Engine:
             hist = key_prompt
             act = self.active = {"rid": rid, "n": n, "sent": 0, "tok": first, "spec": spec, "hist": hist, "samp": samp,
                                  "plen": len(hist), "stops": opt.get("stops")}
+            if os.environ.get("MK_ACC_LOG"):
+                act["cnt0"] = dict(self.counters)
             self.cached = act["hist"]           # the prompt and every committed token after it, as the request goes on
             if spec:
                 from mk_draft import Cal
@@ -511,8 +519,17 @@ class Engine:
         self.counters["tokens"] += len(toks)
         done = act["sent"] >= act["n"]
         events.append((act["rid"], toks, done))
+        act["cyc"] = act.get("cyc", 0) + 1
+        act["ntok"] = act.get("ntok", 0) + len(toks)
         if done:
+            if os.environ.get("MK_ACC_LOG"):
+                # tokens per cycle of this request, and the copy counters it moved (json / ngram / quote cycles, cuts)
+                c0 = act.get("cnt0") or {}
+                keys = ("ngram_cycles", "ngram_tokens", "json_cycles", "quote_cycles", "copy_cut_think", "wide_cycles", "draft_alone")
+                moved = " ".join(f"{k} {self.counters.get(k, 0) - c0.get(k, 0)}" for k in keys)
+                print(f"MK_ACC tokens {act['ntok']} cycles {act['cyc']} per_cycle {act['ntok'] / act['cyc']:.2f} | {moved}", flush=True)
             self._dump(act)
+            self._bank(act)
             self.active = None
             self._busy_t = time.perf_counter()
         return events
