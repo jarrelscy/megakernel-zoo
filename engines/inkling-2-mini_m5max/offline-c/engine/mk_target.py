@@ -37,7 +37,7 @@ PAD = int(os.environ.get("MK_WHATIF_PAD", "0"))   # timing experiment only (0 in
 # independent dispatches of a layer visit in one (kernels: merged dispatches): the q / k / v projections; the three
 # message gates' projections. Same bits (tests/merge.py); no measurable gain (a dispatch costs 1.4 us), so off
 DENSE3 = os.environ.get("MK_DENSE3", "0") == "1"
-GATEM = os.environ.get("MK_GATEM", "0") == "1"
+GATEM = os.environ.get("MK_GATEM", "1") == "1"
 SL_C = int(os.environ.get("MK_SL_C", "4096"))       # tokens whose exact logits a readout computes (0: the 8-bit scan)
 
 

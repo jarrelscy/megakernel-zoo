@@ -2516,7 +2516,7 @@ def gates_m(h, msgs, down_s, fg_s, wt, m0: int) -> list:
 # were taken on a GPU saturated by other processes and were within noise). The counter's device-scope fences are cheap
 # with 16 threadgroups; folding mk_comb into the down kernel the same way (a fence in each of ~1000 threadgroups) was
 # 18 us slower per visit and is not kept.
-ROUTE1 = _osw2.environ.get("MK_ROUTE1", "0") == "1"
+ROUTE1 = _osw2.environ.get("MK_ROUTE1", "1") == "1"
 _ROUTE = f"""
     uint n = thread_position_in_grid.x / 32;
     uint lane = thread_index_in_simdgroup;
@@ -2647,7 +2647,7 @@ def route(w16, x16, bias, zc, M: int = 0):
 # queries. mix2's statements (one threadgroup per (row, layer), the same per-row sums), all J layers in one dispatch.
 # Same bits; 12 message mixes in one dispatch: ~50 us less per loop pass at one row in a dependent microbenchmark
 # (kmicro.py: 115 -> 62 us); off until a pass measures faster on a quiet GPU (see ROUTE1).
-MSGM = _osw2.environ.get("MK_MSGM", "0") == "1"
+MSGM = _osw2.environ.get("MK_MSGM", "1") == "1"
 _mixj = {}
 
 
