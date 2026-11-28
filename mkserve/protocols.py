@@ -195,10 +195,10 @@ def add_routes(app: web.Application, core) -> None:
             raise ValueError("the request body must be a JSON object")
         return body
 
-    async def collect(ids, n, sampling, stops, ignore_eos=False, parse=True, extra=None, stop_ids_extra=()):
+    async def collect(ids, n, sampling, stops, ignore_eos=False, parse=True, extra=None, stop_ids_extra=(), prime=""):
         """A whole answer: (content, reasoning, tool calls, final dict)."""
         content, reasoning, calls, final = "", "", [], None
-        async for step in core.run(ids, n, sampling, stops, ignore_eos, parse, extra=extra, stop_ids_extra=stop_ids_extra):
+        async for step in core.run(ids, n, sampling, stops, ignore_eos, parse, extra=extra, stop_ids_extra=stop_ids_extra, prime=prime):
             if step.get("done"):
                 final = step
             else:
@@ -447,6 +447,19 @@ def add_routes(app: web.Application, core) -> None:
             thought = core.tok.decode(reasoning_ids, skip_special_tokens=True).strip()
             ids = ids + opener + reasoning_ids + [end]
             n = max(1, n - len(reasoning_ids))
+        # tool_choice naming one function ({"type": "function", "function": {"name": ...}}, or "required" with one tool): once
+        # the reasoning is closed, the answer is opened as a call of it, so the model cannot announce the call or stop
+        prime, forced = "", None
+        choice = body.get("tool_choice")
+        if tools and budget is not None and budget >= 0 and not body.get("stream"):
+            if isinstance(choice, dict):
+                forced = (choice.get("function") or {}).get("name")
+            elif choice == "required" and len(body.get("tools") or []) == 1:
+                forced = ((body["tools"][0] or {}).get("function") or {}).get("name")
+            opening = core.tool_opening(forced) if forced else None
+            if opening:
+                ids = ids + opening
+                prime = core.tok.decode(opening, skip_special_tokens=False)
         if body.get("stream"):
             return await openai_stream(request, ids, n, sampling, stops, body, chat=True,
                                        close_thinking=budget is not None and budget >= 0, extra=extra)
@@ -457,7 +470,8 @@ def add_routes(app: web.Application, core) -> None:
             content, reasoning, calls, final = "", "", [], None
             for _ in range(4):
                 c, r, k, part = await collect(ids, n, sampling, stops, bool(body.get("ignore_eos")), extra=extra,
-                                              stop_ids_extra=(think,))
+                                              stop_ids_extra=(think,), prime=prime)
+                prime = ""
                 content += c; reasoning += r; calls += k
                 final = part if final is None else dict(part, completion_tokens=final["completion_tokens"] + part["completion_tokens"])
                 if part.get("stop_token") != think:

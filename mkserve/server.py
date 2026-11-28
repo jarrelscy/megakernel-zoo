@@ -461,10 +461,19 @@ class Core:
             return None, None
         return {"temperature": float(temperature), "top_p": float(top_p or 1.0), "top_k": int(top_k or 0), "seed": seed}, None
 
+    def tool_opening(self, name: str) -> list[int] | None:
+        """The tokens that open a call of tool `name` in Inkling 2's answer format, or None for a model without them."""
+        text = f"<|message_model|>{name}<|content_invoke_tool_json|>"
+        if not self.rt or "content_invoke_tool_json" not in json.dumps(self.rt):
+            return None
+        ids = self.tok.encode(text, add_special_tokens=False).ids
+        return ids if self.tok.decode(ids, skip_special_tokens=False) == text else None
+
     def _decode(self, ids, parse):
         return self.tok.decode(ids, skip_special_tokens=not parse)
 
-    async def run(self, ids: list[int], n: int, sampling=None, stops=(), ignore_eos=False, parse=True, extra=None, stop_ids_extra=()):
+    async def run(self, ids: list[int], n: int, sampling=None, stops=(), ignore_eos=False, parse=True, extra=None, stop_ids_extra=(),
+                  prime: str = ""):
         """Yields one dict per generated token: {"content": str, "reasoning": str, "tool_calls": [...]} (any may be
         empty: a client can time tokens by them), then {"done": True, "finish": "stop"|"length", "prompt_tokens",
         "completion_tokens", "stop_sequence"}. parse: read the answer's structure (response_template) instead of
@@ -474,6 +483,9 @@ class Core:
         hold = max((len(s) for s in stops), default=1) - 1
         stop_ids = (set() if ignore_eos else set(self.eos)) | set(stop_ids_extra)
         parser = ResponseParser(self.rt) if parse and self.rt else None
+        if parser and prime:
+            # the opening of the answer was given in the prompt (a forced tool call): the parser reads it first
+            parser.feed(prime)
         rid = next(self.counter)
         q: asyncio.Queue = asyncio.Queue()
         self.queues[rid] = q
