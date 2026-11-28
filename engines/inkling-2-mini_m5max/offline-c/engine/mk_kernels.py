@@ -495,7 +495,9 @@ _ATT_SH1 = """
     int d4 = (tid % 32) * 4;
     for (int rb = 0; rb < KR; rb += RB) {
         int nr = min(RB, KR - rb);
-        if (p0 + rb + nr - 1 < lo) break;               // rows in order: the later rounds' rows are later still
+        // a round whose rows all lie before the chunk sees none of its keys; a later round's rows may (not a break:
+        // that left the partials of every later full round unwritten, and mk_attention_shared2 read stale memory)
+        if (p0 + rb + nr - 1 < lo) continue;
         int hiall = min(lo + CH - 1, p0 + rb + nr - 1);
         if (win > 0 && lo + CH - 1 < p0 + rb - win + 1) continue;     // the chunk is before every window of the round
         for (int i = tid; i < 3 * nr * 128; i += TG) {
@@ -2562,7 +2564,7 @@ def gates_m(h, msgs, down_s, fg_s, wt, m0: int) -> list:
 # were taken on a GPU saturated by other processes and were within noise). The counter's device-scope fences are cheap
 # with 16 threadgroups; folding mk_comb into the down kernel the same way (a fence in each of ~1000 threadgroups) was
 # 18 us slower per visit and is not kept.
-ROUTE1 = _osw2.environ.get("MK_ROUTE1", "1") == "1"
+ROUTE1 = _osw2.environ.get("MK_ROUTE1", "0") == "1"      # off: a race in its cross-threadgroup handoff (only thread 0 fences before the counter) gave stale router logits under GPU load; off measured the same speed at 3 passes
 _ROUTE = f"""
     uint n = thread_position_in_grid.x / 32;
     uint lane = thread_index_in_simdgroup;

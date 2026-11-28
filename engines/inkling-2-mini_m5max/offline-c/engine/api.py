@@ -59,6 +59,8 @@ class Engine:
                 if self.tg.draft2:
                     from mk_draft2 import Draft2
                     self.draft = Draft2(self.tg.draft2, self.tg)
+                    from mk_draft import json_copy_tokens
+                    self.draft.jc_ts = json_copy_tokens(model_dir)
                 else:
                     from mk_draft import Draft
                     self.draft = Draft(model_dir, self.tg)

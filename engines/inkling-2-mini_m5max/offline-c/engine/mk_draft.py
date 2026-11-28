@@ -220,16 +220,7 @@ class Draft:
         self._sfn = {}
         self._fn = None
         self.n1 = int(os.environ.get("MK_DRAFT_N1", "3"))     # Markov steps before the first look at the probabilities
-        self.jc_ts = None
-        if JSON_COPY:
-            try:
-                from tokenizers import Tokenizer
-                tk = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
-                self.jc_ts = tk.decode_batch([[i] for i in range(tk.get_vocab_size())], skip_special_tokens=False)
-                _tok_ids(self.jc_ts)
-            except Exception as e:      # no tokenizer: plain copy proposals only
-                print("MK_JSON_COPY off:", e, flush=True)
-                self.jc_ts = None
+        self.jc_ts = json_copy_tokens(model_dir)
         self.review_r = int(os.environ.get("MK_REVIEW", "0"))
         self.review_thr = float(os.environ.get("MK_REVIEW_THR", "0.2"))
         del w
@@ -548,6 +539,17 @@ class Draft:
                 jc = None
         if cont is None:
             cont = ngram(act["hist"], self.ng_min, 15 if wide else nd) if self.ng_min > 0 else None
+        if cont is not None:
+            # a copy of the prompt can reach an input-embedding position (api.py: a negative stand-in id, e.g. audio):
+            # not a token. Cut the proposal there (int32 wraps it into an out-of-range embedding row; mk_draft2 raises)
+            v = self.tg.vocab
+            ok = next((i for i, t in enumerate(cont) if not 0 <= int(t) < v), len(cont))
+            if ok < len(cont):
+                cnt["copy_cut_nontoken"] = cnt.get("copy_cut_nontoken", 0) + 1
+                if ok > 0:
+                    cont = cont[:ok]
+                else:
+                    cont, jc = None, None
         dp = act.pop("draft", None)
         nod = act.pop("nodraft", False)
         m_ok = getattr(self, "rounds", 0) > 0 and left >= 3 and act.get("cal") is not None and (samp is None or getattr(self, "rounds_samp", False))
@@ -853,6 +855,21 @@ def _tok_ids(ts):
                             "q1": {first['"']} | ({first[' "']} if ' "' in first else set())}
     return r
 
+
+
+def json_copy_tokens(model_dir):
+    """Each token id's text, for JsonCopy (MK_JSON_COPY), or None when it is off or the tokenizer is missing."""
+    if not JSON_COPY:
+        return None
+    try:
+        from tokenizers import Tokenizer
+        tk = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
+        ts = tk.decode_batch([[i] for i in range(tk.get_vocab_size())], skip_special_tokens=False)
+        _tok_ids(ts)
+        return ts
+    except Exception as e:      # no tokenizer: plain copy proposals only
+        print("MK_JSON_COPY off:", e, flush=True)
+        return None
 
 class JsonCopy:
     """Per-request state of the JSON-aware proposals (see above)."""
